@@ -553,6 +553,14 @@ pub trait SessionReader {
     fn read(&self, pane: &Pane) -> Result<ParsedSession>;
 }
 
+fn written_within(path: &Path, window: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= window)
+}
+
 pub struct LocalSessionReader {
     home: PathBuf,
     /// Panes whose session Herdr has not reported yet. Resolving those costs a
@@ -582,7 +590,26 @@ impl LocalSessionReader {
             // A reported identity can outlive its file (resume, /clear); fall
             // through to the cwd scan instead of pinning the pane to an error.
             match self.reported_path(pane, session) {
-                Ok(path) => return Ok(path),
+                Ok(path) => {
+                    // The pane is processed moments after it was active, so
+                    // its live session file was just written. A reported file
+                    // that stayed untouched while a sibling was written is a
+                    // stale identity, not the live conversation.
+                    if written_within(&path, Duration::from_secs(30)) {
+                        return Ok(path);
+                    }
+                    if let Some(cwd) = pane.cwd.as_deref()
+                        && let Ok(newest) = match pane.agent {
+                            AgentKind::Claude => self.newest_claude_session(cwd),
+                            AgentKind::Codex => self.newest_codex_session(cwd),
+                        }
+                        && newest != path
+                        && written_within(&newest, Duration::from_secs(30))
+                    {
+                        return Ok(newest);
+                    }
+                    return Ok(path);
+                }
                 Err(error) if pane.cwd.is_none() => return Err(error),
                 Err(_) => {}
             }
