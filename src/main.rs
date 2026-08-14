@@ -1,7 +1,7 @@
 use agent_context_labels::{
     AnalysisClient, CliHerdr, LocalSessionReader, OpenRouterClient, PLUGIN_ID, POLL_INTERVAL,
     SessionEvent, StatePaths, Watcher, analysis_context, append_log, apply_hook_payload,
-    detect_language, exclusive_watcher_lock, request_refresh, set_automatic_summaries,
+    apply_priority_agent_view, exclusive_watcher_lock, request_refresh, set_automatic_summaries,
 };
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
@@ -54,6 +54,16 @@ fn watch(paths: &StatePaths, home: &Path) -> Result<()> {
         paths.clone(),
     );
     append_log(paths, "watcher_started", None, Some(PLUGIN_ID))?;
+    // Ordering is a nicety; a rejected view must not stop status reporting.
+    match apply_priority_agent_view(home) {
+        Ok(()) => append_log(paths, "agent_view_applied", None, None)?,
+        Err(error) => append_log(
+            paths,
+            "agent_view_failed",
+            None,
+            Some(&format!("{error:#}")),
+        )?,
+    }
     let mut failing_since: Option<(u32, SystemTime)> = None;
     loop {
         match watcher.scan() {
@@ -130,7 +140,7 @@ fn main() -> Result<()> {
                 },
             ];
             let context = analysis_context(&events);
-            let analysis = client.analyze(&context, detect_language(&context))?;
+            let analysis = client.analyze(&context)?;
             append_log(
                 &paths,
                 "live_provider_verified",

@@ -33,6 +33,7 @@ Each supported pane gets a short task label, lifecycle status, agent kind, and t
 - Shows compact elapsed time such as `12s`, `4m`, `2h`, or `3d`.
 - Keeps completion semantics aligned with Herdr's native `working`, `done`, `idle`, `blocked`, and `unknown` lifecycle states.
 - Uses native agent hooks for high-confidence interaction signals and OpenRouter for task summaries and plain-text question detection.
+- Publishes a `sort_rank` token and installs an `agent.view.set` sort on watcher start, so the sidebar orders panes attention-first: question/approval, then error, then unseen completion, then working, then idle.
 - Runs one headless watcher, so no dedicated watcher pane is required.
 
 The data flow is intentionally small:
@@ -202,7 +203,7 @@ The accepted provider output is exactly one JSON object with these fields:
 {"summary":"Retry policy cleanup","attention":"none"}
 ```
 
-`summary` is normalized to one line and at most 30 characters.
+`summary` is normalized to one line and at most 30 characters, and the provider is instructed to write it in Korean.
 `attention` accepts only `question` or `none` because approval and error states come from native hooks rather than model inference.
 
 The local safety ceiling is 1,000 requests per UTC day, independent of the OpenRouter account's own limits.

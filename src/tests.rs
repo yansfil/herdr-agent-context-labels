@@ -804,8 +804,14 @@ fn metadata_clears_every_status_token_it_may_own() {
 
     assert!(args.iter().any(|item| item == "summary=작업 요약"));
     assert!(args.iter().any(|item| item == "status_approval=!"));
-    assert!(args.iter().any(|item| item == "agent_codex=codex"));
+    assert!(args.iter().any(|item| item == "agent_codex=⬡"));
     assert!(args.iter().any(|item| item == "elapsed=7s"));
+    // Approval outranks everything else in the attention-first ordering.
+    assert!(args.iter().any(|item| item == "sort_rank=0"));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--clear-token" && pair[1] == "sort_rank")
+    );
     // Every status token is cleared, so two icons can never render at once.
     for token in STATUS_TOKENS {
         assert!(
@@ -827,16 +833,18 @@ fn elapsed_time_uses_compact_second_minute_hour_and_day_units() {
 }
 
 #[test]
-fn chooses_majority_language_with_korean_default() {
-    assert_eq!(
-        detect_language("작업 요약을 만들어 주세요"),
-        Language::Korean
-    );
-    assert_eq!(
-        detect_language("summarize the active work"),
-        Language::English
-    );
-    assert_eq!(detect_language("123 !?"), Language::Korean);
+fn sort_rank_orders_user_blocking_states_before_ambient_states() {
+    let ranks = [
+        StatusIcon::Question,
+        StatusIcon::Approval,
+        StatusIcon::Error,
+        StatusIcon::Done,
+        StatusIcon::Working,
+        StatusIcon::Idle,
+        StatusIcon::Stale,
+    ]
+    .map(StatusIcon::sort_rank);
+    assert_eq!(ranks, ["0", "0", "1", "2", "3", "4", "5"]);
 }
 
 // ------------------------------------------------------------------ doubles
@@ -894,7 +902,7 @@ impl FakeClient {
 }
 
 impl AnalysisClient for FakeClient {
-    fn analyze(&self, _: &str, _: Language) -> Result<Analysis> {
+    fn analyze(&self, _: &str) -> Result<Analysis> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Analysis {
             summary: "작업 요약".into(),
@@ -906,7 +914,7 @@ impl AnalysisClient for FakeClient {
 struct QuestionClient;
 
 impl AnalysisClient for QuestionClient {
-    fn analyze(&self, _: &str, _: Language) -> Result<Analysis> {
+    fn analyze(&self, _: &str) -> Result<Analysis> {
         Ok(Analysis {
             summary: "음료 소비량 퀴즈 풀이".into(),
             attention: Some(Attention::Question),
@@ -917,7 +925,7 @@ impl AnalysisClient for QuestionClient {
 struct FailingClient;
 
 impl AnalysisClient for FailingClient {
-    fn analyze(&self, _: &str, _: Language) -> Result<Analysis> {
+    fn analyze(&self, _: &str) -> Result<Analysis> {
         Err(provider_transport_error(ureq::Error::StatusCode(429)))
     }
 }
