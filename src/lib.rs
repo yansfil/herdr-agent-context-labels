@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PLUGIN_ID: &str = "herdr-agent-context-labels";
-pub const MODEL: &str = "poolside/laguna-s-2.1:free";
+pub const MODEL: &str = "nvidia/nemotron-3-super-120b-a12b:free";
 /// Upper bound on the analysis context. The context normally spans the last
 /// user turn; this only guards against one enormous turn.
 pub const MAX_ANALYSIS_CONTEXT_CHARS: usize = 4_000;
@@ -1507,10 +1507,6 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
     }
 
     fn process(&mut self, pane: &Pane, forced: bool) -> Result<bool> {
-        if pane.agent_status == "working" && !forced {
-            let display = self.display_for(pane)?;
-            return self.report_if_changed(pane, &display);
-        }
         let parsed = match self.session_reader.read(pane) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1531,6 +1527,52 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 Some(pane),
                 Some(&format!("lines={}", parsed.skipped_lines)),
             )?;
+        }
+        let newest_user_is_last = parsed
+            .events
+            .last()
+            .is_some_and(|event| event.role == "user");
+        // While the agent runs, analyze exactly the moment the user's prompt is
+        // the newest event: the summary then names the request being worked on.
+        // Once assistant output lands the working pane is left alone again.
+        if pane.agent_status == "working" && !forced && !newest_user_is_last {
+            let display = self.display_for(pane)?;
+            return self.report_if_changed(pane, &display);
+        }
+        // An interruption is the user's own act, not a new task: keep the last
+        // summary, mark it, and spend no provider request on the torn turn.
+        let interrupted = pane.agent_status != "working"
+            && parsed
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.role == "user")
+                .is_some_and(|event| event.text.trim_start().starts_with("[Request interrupted"));
+        if interrupted && !forced {
+            let now = unix_time_ms()?;
+            let state = self
+                .display_states
+                .panes
+                .entry(pane.id.clone())
+                .or_insert_with(|| PersistedDisplayState {
+                    state_change_seq: pane.state_change_seq,
+                    changed_unix_ms: now,
+                    ..PersistedDisplayState::default()
+                });
+            let context = analysis_context(&parsed.events);
+            state.analysis_fingerprint = Some(context_fingerprint(&context));
+            if let Some(summary) = &state.summary
+                && !summary.starts_with("⏸")
+            {
+                state.summary = Some(format!("⏸ {summary}"));
+            }
+            write_state_json(
+                &self.paths.display_state(),
+                &self.display_states,
+                "display-state",
+            )?;
+            let display = self.display_for(pane)?;
+            return self.report_if_changed(pane, &display);
         }
         if !self.settings.automatic_summaries {
             if forced {
