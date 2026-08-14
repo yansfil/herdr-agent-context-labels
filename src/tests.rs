@@ -804,10 +804,10 @@ fn metadata_clears_every_status_token_it_may_own() {
 
     assert!(args.iter().any(|item| item == "summary=작업 요약"));
     assert!(args.iter().any(|item| item == "status_approval=!"));
-    assert!(args.iter().any(|item| item == "agent_codex=⬡"));
+    assert!(args.iter().any(|item| item == "agent_codex=⬢"));
     assert!(args.iter().any(|item| item == "elapsed=7s"));
-    // Approval outranks everything else in the attention-first ordering.
-    assert!(args.iter().any(|item| item == "sort_rank=0"));
+    // Approval sits in the user-blocking group at the top of the ordering.
+    assert!(args.iter().any(|item| item == "sort_rank=1"));
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "--clear-token" && pair[1] == "sort_rank")
@@ -834,17 +834,21 @@ fn elapsed_time_uses_compact_second_minute_hour_and_day_units() {
 
 #[test]
 fn sort_rank_orders_user_blocking_states_before_ambient_states() {
-    let ranks = [
-        StatusIcon::Question,
-        StatusIcon::Approval,
-        StatusIcon::Error,
-        StatusIcon::Done,
-        StatusIcon::Working,
-        StatusIcon::Idle,
-        StatusIcon::Stale,
-    ]
-    .map(StatusIcon::sort_rank);
-    assert_eq!(ranks, ["0", "0", "1", "2", "3", "4", "5"]);
+    let order = resolve_sort_order(None);
+    let ranks = DEFAULT_SORT_ORDER.map(|icon| sort_rank(&order, icon));
+    assert_eq!(ranks, ["0", "1", "2", "3", "4", "5", "6"]);
+}
+
+#[test]
+fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
+    let order = resolve_sort_order(Some(r#"{"order":["working","question","nonsense"]}"#));
+    assert_eq!(order[0], StatusIcon::Working);
+    assert_eq!(order[1], StatusIcon::Question);
+    // Unlisted states keep their default relative order after the listed ones.
+    assert_eq!(order[2], StatusIcon::Approval);
+    assert_eq!(order[6], StatusIcon::Stale);
+    // Broken JSON must not take the watcher down or scramble the order.
+    assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);
 }
 
 // ------------------------------------------------------------------ doubles

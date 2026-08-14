@@ -93,21 +93,95 @@ impl StatusIcon {
         }
     }
 
-    /// Sidebar ordering key, published as the `sort_rank` token and consumed by
-    /// the plugin's `agent.view.set` sort. Lower sorts first: states waiting on
-    /// the user, then an unseen completion, then ambient states. Token sorts
-    /// compare strings, so every rank stays one digit.
-    pub const fn sort_rank(self) -> &'static str {
+    /// Name used to reference this state in the user's sort-order file.
+    pub const fn config_name(self) -> &'static str {
         match self {
-            Self::Question | Self::Approval => "0",
-            Self::Error => "1",
-            Self::Done => "2",
-            Self::Working => "3",
-            Self::Idle => "4",
-            Self::Stale => "5",
+            Self::Question => "question",
+            Self::Approval => "approval",
+            Self::Error => "error",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Idle => "idle",
+            Self::Stale => "stale",
         }
     }
 }
+
+/// Attention-first default: states waiting on the user, then an unseen
+/// completion, then ambient states.
+pub const DEFAULT_SORT_ORDER: [StatusIcon; 7] = [
+    StatusIcon::Question,
+    StatusIcon::Approval,
+    StatusIcon::Error,
+    StatusIcon::Done,
+    StatusIcon::Working,
+    StatusIcon::Idle,
+    StatusIcon::Stale,
+];
+
+/// Optional user override, read from the plugin's Herdr-assigned config
+/// directory: `{"order": ["question", "working", ...]}`. Herdr owns the path
+/// contract (`HERDR_PLUGIN_CONFIG_DIR`), the plugin owns the file.
+pub const SORT_ORDER_FILE: &str = "sort-order.json";
+
+/// Turn an optional user order into a complete one: listed names first in the
+/// given order, unknown names ignored, missing states appended in default
+/// order. Invalid JSON keeps the default rather than failing the watcher.
+pub fn resolve_sort_order(raw: Option<&str>) -> [StatusIcon; 7] {
+    let Some(raw) = raw else {
+        return DEFAULT_SORT_ORDER;
+    };
+    let Some(names) = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.get("order").cloned())
+        .and_then(|order| serde_json::from_value::<Vec<String>>(order).ok())
+    else {
+        return DEFAULT_SORT_ORDER;
+    };
+    let mut order = Vec::with_capacity(7);
+    for name in names {
+        if let Some(icon) = DEFAULT_SORT_ORDER
+            .iter()
+            .find(|icon| icon.config_name() == name)
+            && !order.contains(icon)
+        {
+            order.push(*icon);
+        }
+    }
+    for icon in DEFAULT_SORT_ORDER {
+        if !order.contains(&icon) {
+            order.push(icon);
+        }
+    }
+    let mut resolved = DEFAULT_SORT_ORDER;
+    resolved.copy_from_slice(&order);
+    resolved
+}
+
+/// One digit per state so the token sort's string comparison matches the
+/// numeric order.
+pub fn sort_rank(order: &[StatusIcon; 7], status: StatusIcon) -> String {
+    let position = order
+        .iter()
+        .position(|icon| *icon == status)
+        .unwrap_or(order.len());
+    position.to_string()
+}
+
+/// Resolved once per process: the watcher reports every rank, so a mid-run
+/// edit takes effect on the next watcher start, like the agent view itself.
+static SORT_ORDER: LazyLock<[StatusIcon; 7]> = LazyLock::new(|| {
+    let path = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(".config/herdr/plugins/config/herdr-agent-context-labels")
+            })
+        })
+        .map(|dir| dir.join(SORT_ORDER_FILE));
+    let raw = path.and_then(|path| fs::read_to_string(path).ok());
+    resolve_sort_order(raw.as_deref())
+});
 
 /// Every status token this plugin may own. The watcher clears the whole set on
 /// each report so exactly one of them is ever live for a pane.
@@ -151,10 +225,11 @@ impl AgentKind {
     }
 
     /// Sidebar glyph rather than a word: the row already carries the workspace
-    /// name, and the user's config colors the two tokens differently.
+    /// name, and the user's config colors the two tokens differently. Both
+    /// glyphs are filled so they stay visible at one cell.
     const fn label(self) -> &'static str {
         match self {
-            Self::Codex => "⬡",
+            Self::Codex => "⬢",
             Self::Claude => "❋",
         }
     }
@@ -1142,7 +1217,7 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
             display.status.symbol(display.working_frame)
         ),
         "--token".to_owned(),
-        format!("sort_rank={}", display.status.sort_rank()),
+        format!("sort_rank={}", sort_rank(&SORT_ORDER, display.status)),
     ]);
     if let Some(elapsed) = &display.elapsed {
         args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]);
