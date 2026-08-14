@@ -1280,15 +1280,6 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
     if let Some(summary) = &display.summary {
         args.extend(["--token".to_owned(), format!("summary={summary}")]);
     }
-    for token in STATUS_TOKENS.iter().copied().chain([
-        "elapsed",
-        "agent_codex",
-        "agent_claude",
-        "sort_rank",
-        "unseen",
-    ]) {
-        args.extend(["--clear-token".to_owned(), token.to_owned()]);
-    }
     // Attention states carry a `_new` variant while unfocused since the last
     // change, so the user's config can color an unread question differently
     // from one already looked at.
@@ -1298,6 +1289,14 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
         (true, StatusIcon::Error) => "status_error_new",
         _ => display.status.token_name(),
     };
+    // One report may touch at most 16 tokens, so clear only what this report
+    // does not overwrite: every other status token, and elapsed when absent.
+    // sort_rank and the agent glyph are always set, never cleared.
+    for token in STATUS_TOKENS.iter().copied() {
+        if token != status_token {
+            args.extend(["--clear-token".to_owned(), token.to_owned()]);
+        }
+    }
     args.extend([
         "--token".to_owned(),
         format!(
@@ -1307,8 +1306,9 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
         "--token".to_owned(),
         format!("sort_rank={}", sort_rank(&SORT_ORDER, display.sort_key)),
     ]);
-    if let Some(elapsed) = &display.elapsed {
-        args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]);
+    match &display.elapsed {
+        Some(elapsed) => args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]),
+        None => args.extend(["--clear-token".to_owned(), "elapsed".to_owned()]),
     }
     args.extend([
         "--token".to_owned(),

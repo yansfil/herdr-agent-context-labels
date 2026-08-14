@@ -841,18 +841,24 @@ fn metadata_clears_every_status_token_it_may_own() {
     assert!(args.iter().any(|item| item == "elapsed=7s"));
     // Approval sits in the user-blocking group at the top of the ordering.
     assert!(args.iter().any(|item| item == "sort_rank=1"));
-    assert!(
-        args.windows(2)
-            .any(|pair| pair[0] == "--clear-token" && pair[1] == "sort_rank")
-    );
-    // Every status token is cleared, so two icons can never render at once.
+    // Every other status token is cleared, so two icons can never render at
+    // once; the one being set is not cleared to stay under the 16-token cap.
     for token in STATUS_TOKENS {
+        if token == "status_approval" {
+            continue;
+        }
         assert!(
             args.windows(2)
                 .any(|pair| pair[0] == "--clear-token" && pair[1] == token),
             "{token} is not cleared"
         );
     }
+    // The report never exceeds Herdr's 16-token budget.
+    let touched = args
+        .iter()
+        .filter(|a| *a == "--token" || *a == "--clear-token")
+        .count();
+    assert!(touched <= 16, "report touches {touched} tokens");
     // The pane title belongs to the user, not to this plugin.
     assert!(!args.iter().any(|item| item == "--title"));
 }
