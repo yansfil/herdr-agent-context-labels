@@ -1811,6 +1811,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 changed_unix_ms: now,
                 ..PersistedDisplayState::default()
             });
+        // A semantic question arrives without any lifecycle change, so the
+        // unseen flag must be raised here or it would never light up.
+        if analysis.attention.is_some() && state.semantic_attention != analysis.attention {
+            state.unseen = !pane.focused;
+        }
         state.summary = Some(analysis.summary.clone());
         state.semantic_attention = analysis.attention;
         state.interrupted = false;
