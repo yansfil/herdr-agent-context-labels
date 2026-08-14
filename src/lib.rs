@@ -574,7 +574,13 @@ impl LocalSessionReader {
 
     fn session_path(&self, pane: &Pane) -> Result<PathBuf> {
         if let Some(session) = &pane.agent_session {
-            return self.reported_path(pane, session);
+            // A reported identity can outlive its file (resume, /clear); fall
+            // through to the cwd scan instead of pinning the pane to an error.
+            match self.reported_path(pane, session) {
+                Ok(path) => return Ok(path),
+                Err(error) if pane.cwd.is_none() => return Err(error),
+                Err(_) => {}
+            }
         }
         let cwd = pane
             .cwd
