@@ -468,10 +468,17 @@ static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
 /// block. Nothing else is dropped: the previous line filter also deleted every
 /// Markdown bullet, which is most of what an agent actually says.
 pub fn analysis_context(events: &[SessionEvent]) -> String {
-    let start = events
+    // Span the last two user turns, not one: whether the final assistant
+    // message is a fresh question or a wrap-up of one already answered is
+    // often only visible in the preceding exchange.
+    let last = events
         .iter()
         .rposition(|event| event.role == "user")
         .unwrap_or(0);
+    let start = events[..last]
+        .iter()
+        .rposition(|event| event.role == "user")
+        .unwrap_or(last);
     let transcript = events[start..]
         .iter()
         .map(|event| format!("{}: {}", event.role, event.text))

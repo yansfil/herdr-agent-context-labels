@@ -216,15 +216,23 @@ fn redaction_preserves_prose_and_bullets() {
 // ---------------------------------------------------------------- AC5
 
 #[test]
-fn context_spans_the_last_user_turn() {
+fn context_spans_the_last_two_user_turns() {
     let events = [
         SessionEvent {
             role: "user",
-            text: "예전 요청입니다".to_owned(),
+            text: "가장 오래된 요청입니다".to_owned(),
         },
         SessionEvent {
             role: "assistant",
-            text: "예전 응답입니다".to_owned(),
+            text: "가장 오래된 응답입니다".to_owned(),
+        },
+        SessionEvent {
+            role: "user",
+            text: "직전 요청입니다".to_owned(),
+        },
+        SessionEvent {
+            role: "assistant",
+            text: "직전 응답입니다".to_owned(),
         },
         SessionEvent {
             role: "user",
@@ -244,9 +252,13 @@ fn context_spans_the_last_user_turn() {
 
     assert!(context.contains("최신 요청입니다"));
     assert!(context.contains("마지막으로 답을 기다립니다"));
-    // A long turn no longer pushes the question that opened it out of view.
-    assert!(!context.contains("예전 요청입니다"));
-    assert!(!context.contains("예전 응답입니다"));
+    // The previous exchange stays visible so a wrap-up of an already answered
+    // question is not mistaken for a fresh one.
+    assert!(context.contains("직전 요청입니다"));
+    assert!(context.contains("직전 응답입니다"));
+    // Anything older still stays out.
+    assert!(!context.contains("가장 오래된 요청입니다"));
+    assert!(!context.contains("가장 오래된 응답입니다"));
 }
 
 // ---------------------------------------------------------------- AC7
