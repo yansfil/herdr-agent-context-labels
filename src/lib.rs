@@ -1621,6 +1621,12 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 &self.display_states,
                 "display-state",
             )?;
+            append_log(
+                &self.paths,
+                "interruption_marked",
+                Some(pane),
+                Some(&format!("status={}", pane.agent_status)),
+            )?;
             let display = self.display_for(pane)?;
             return self.report_if_changed(pane, &display);
         }
@@ -1891,7 +1897,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
     fn display_for(&self, pane: &Pane) -> Result<Display> {
         let attention = self.resolve_attention(pane);
         let interrupted = attention.is_none()
-            && matches!(pane.agent_status.as_str(), "idle" | "done")
+            && matches!(pane.agent_status.as_str(), "idle" | "done" | "blocked")
             && self
                 .display_states
                 .panes
