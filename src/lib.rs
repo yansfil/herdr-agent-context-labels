@@ -576,23 +576,30 @@ impl LocalSessionReader {
         if let Some(session) = &pane.agent_session {
             return self.reported_path(pane, session);
         }
-        if let Some(path) = self.resolved.borrow().get(&pane.id)
-            && path.is_file()
-        {
-            return Ok(path.clone());
-        }
         let cwd = pane
             .cwd
             .as_deref()
             .ok_or_else(|| anyhow!("session_cwd_unavailable"))?;
-        let path = match pane.agent {
+        // Re-resolve on every read: a pane without a reported identity can
+        // start a newer session at any time, and pinning the first answer for
+        // the process lifetime left panes reading a finished conversation.
+        // Reads only happen on state changes, so the scan cost stays rare.
+        match match pane.agent {
             AgentKind::Claude => self.newest_claude_session(cwd),
             AgentKind::Codex => self.newest_codex_session(cwd),
-        }?;
-        self.resolved
-            .borrow_mut()
-            .insert(pane.id.clone(), path.clone());
-        Ok(path)
+        } {
+            Ok(path) => {
+                self.resolved
+                    .borrow_mut()
+                    .insert(pane.id.clone(), path.clone());
+                Ok(path)
+            }
+            // A transient scan failure falls back to the last known file.
+            Err(error) => match self.resolved.borrow().get(&pane.id) {
+                Some(path) if path.is_file() => Ok(path.clone()),
+                _ => Err(error),
+            },
+        }
     }
 
     fn reported_path(&self, pane: &Pane, session: &AgentSession) -> Result<PathBuf> {
