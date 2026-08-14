@@ -200,17 +200,6 @@ struct AgentListItem {
 
 impl AgentListItem {
     fn into_pane(self) -> Option<Pane> {
-        // A herdr-mirror pane is a remote agent's projection. The watcher on
-        // the remote machine owns its analysis and status tokens, which the
-        // mirror already forwards; reporting here would clobber them with a
-        // verdict made without the remote session file.
-        if self
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.ends_with("/herdr-mirror/.mirror-pane"))
-        {
-            return None;
-        }
         Some(Pane {
             agent: self.agent.as_deref().and_then(AgentKind::from_herdr)?,
             id: self.pane_id,
@@ -1553,11 +1542,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             Some(Attention::Question | Attention::Approval)
                 if blocked != state.observed_blocked =>
             {
-                if blocked {
-                    Change::Observe
-                } else {
-                    Change::Retire
-                }
+                if blocked { Change::Observe } else { Change::Retire }
             }
             Some(Attention::Error) if pane.agent_status == "working" => Change::Retire,
             _ => return Ok(()),
