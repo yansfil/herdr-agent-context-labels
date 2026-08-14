@@ -1,0 +1,4 @@
+/target/
+.DS_Store
+# Local requirements and verification pipeline state
+/agents/
