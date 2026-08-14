@@ -1941,6 +1941,8 @@ pub fn apply_priority_agent_view(home: &Path) -> Result<()> {
             "label": "attention priority",
             "sort": [
                 {"field": {"token": "sort_rank"}, "order": "asc"},
+                // Within a rank, panes the user has not viewed yet come first.
+                {"field": "seen", "order": "asc"},
                 {"field": "state_change_seq", "order": "desc"},
             ],
         },
