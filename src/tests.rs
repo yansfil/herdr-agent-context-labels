@@ -643,7 +643,7 @@ fn a_cleared_hook_retires_an_older_semantic_verdict() {
     // No hook has spoken: the inference stands.
     assert_eq!(
         watcher.resolve_attention(&subject),
-        Some(Attention::Question)
+        Some((Attention::Question, AttentionSource::Semantic))
     );
 
     // The hook says the interaction ended after that inference was drawn.
@@ -666,7 +666,7 @@ fn a_cleared_hook_retires_an_older_semantic_verdict() {
         .analysis_unix_ms = 3_000;
     assert_eq!(
         watcher.resolve_attention(&subject),
-        Some(Attention::Question)
+        Some((Attention::Question, AttentionSource::Semantic))
     );
 
     // A live hook signal always wins.
@@ -678,7 +678,7 @@ fn a_cleared_hook_retires_an_older_semantic_verdict() {
         .attention = Some(Attention::Approval);
     assert_eq!(
         watcher.resolve_attention(&subject),
-        Some(Attention::Approval)
+        Some((Attention::Approval, AttentionSource::Hook))
     );
 }
 
@@ -797,6 +797,7 @@ fn metadata_clears_every_status_token_it_may_own() {
         &Display {
             summary: Some("작업 요약".into()),
             status: StatusIcon::Approval,
+            sort_key: SortKey::Approval,
             elapsed: Some("7s".into()),
             ..Display::default()
         },
@@ -836,17 +837,19 @@ fn elapsed_time_uses_compact_second_minute_hour_and_day_units() {
 fn sort_rank_orders_user_blocking_states_before_ambient_states() {
     let order = resolve_sort_order(None);
     let ranks = DEFAULT_SORT_ORDER.map(|icon| sort_rank(&order, icon));
-    assert_eq!(ranks, ["0", "1", "2", "3", "4", "5", "6"]);
+    assert_eq!(ranks, ["0", "1", "2", "3", "4", "5", "6", "7"]);
+    // The hook-confirmed question outranks the provider-inferred one.
+    assert!(sort_rank(&order, SortKey::Question) < sort_rank(&order, SortKey::SemanticQuestion));
 }
 
 #[test]
 fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
     let order = resolve_sort_order(Some(r#"{"order":["working","question","nonsense"]}"#));
-    assert_eq!(order[0], StatusIcon::Working);
-    assert_eq!(order[1], StatusIcon::Question);
+    assert_eq!(order[0], SortKey::Working);
+    assert_eq!(order[1], SortKey::Question);
     // Unlisted states keep their default relative order after the listed ones.
-    assert_eq!(order[2], StatusIcon::Approval);
-    assert_eq!(order[6], StatusIcon::Stale);
+    assert_eq!(order[2], SortKey::Approval);
+    assert_eq!(order[7], SortKey::Stale);
     // Broken JSON must not take the watcher down or scramble the order.
     assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);
 }

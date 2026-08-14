@@ -92,12 +92,30 @@ impl StatusIcon {
             Self::Stale => "status_stale",
         }
     }
+}
 
+/// Ordering key for the sidebar, finer than [`StatusIcon`]: a question proven
+/// by a native hook outranks one inferred by the provider, even though both
+/// render as `?`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Question,
+    Approval,
+    SemanticQuestion,
+    Error,
+    Done,
+    Working,
+    Idle,
+    Stale,
+}
+
+impl SortKey {
     /// Name used to reference this state in the user's sort-order file.
     pub const fn config_name(self) -> &'static str {
         match self {
             Self::Question => "question",
             Self::Approval => "approval",
+            Self::SemanticQuestion => "semantic_question",
             Self::Error => "error",
             Self::Working => "working",
             Self::Done => "done",
@@ -107,16 +125,18 @@ impl StatusIcon {
     }
 }
 
-/// Attention-first default: states waiting on the user, then an unseen
-/// completion, then ambient states.
-pub const DEFAULT_SORT_ORDER: [StatusIcon; 7] = [
-    StatusIcon::Question,
-    StatusIcon::Approval,
-    StatusIcon::Error,
-    StatusIcon::Done,
-    StatusIcon::Working,
-    StatusIcon::Idle,
-    StatusIcon::Stale,
+/// Attention-first default: hook-confirmed interaction states, then the
+/// provider-inferred question, then error, an unseen completion, and the
+/// ambient states.
+pub const DEFAULT_SORT_ORDER: [SortKey; 8] = [
+    SortKey::Question,
+    SortKey::Approval,
+    SortKey::SemanticQuestion,
+    SortKey::Error,
+    SortKey::Done,
+    SortKey::Working,
+    SortKey::Idle,
+    SortKey::Stale,
 ];
 
 /// Optional user override, read from the plugin's Herdr-assigned config
@@ -127,7 +147,7 @@ pub const SORT_ORDER_FILE: &str = "sort-order.json";
 /// Turn an optional user order into a complete one: listed names first in the
 /// given order, unknown names ignored, missing states appended in default
 /// order. Invalid JSON keeps the default rather than failing the watcher.
-pub fn resolve_sort_order(raw: Option<&str>) -> [StatusIcon; 7] {
+pub fn resolve_sort_order(raw: Option<&str>) -> [SortKey; 8] {
     let Some(raw) = raw else {
         return DEFAULT_SORT_ORDER;
     };
@@ -160,7 +180,7 @@ pub fn resolve_sort_order(raw: Option<&str>) -> [StatusIcon; 7] {
 
 /// One digit per state so the token sort's string comparison matches the
 /// numeric order.
-pub fn sort_rank(order: &[StatusIcon; 7], status: StatusIcon) -> String {
+pub fn sort_rank(order: &[SortKey; 8], status: SortKey) -> String {
     let position = order
         .iter()
         .position(|icon| *icon == status)
@@ -170,7 +190,7 @@ pub fn sort_rank(order: &[StatusIcon; 7], status: StatusIcon) -> String {
 
 /// Resolved once per process: the watcher reports every rank, so a mid-run
 /// edit takes effect on the next watcher start, like the agent view itself.
-static SORT_ORDER: LazyLock<[StatusIcon; 7]> = LazyLock::new(|| {
+static SORT_ORDER: LazyLock<[SortKey; 8]> = LazyLock::new(|| {
     let path = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -305,10 +325,19 @@ impl AgentListItem {
     }
 }
 
+/// Which side produced an attention verdict; a hook is a fact, the provider is
+/// an inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionSource {
+    Hook,
+    Semantic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Display {
     pub summary: Option<String>,
     pub status: StatusIcon,
+    pub sort_key: SortKey,
     pub elapsed: Option<String>,
     pub working_frame: bool,
 }
@@ -318,6 +347,7 @@ impl Default for Display {
         Self {
             summary: None,
             status: StatusIcon::Stale,
+            sort_key: SortKey::Stale,
             elapsed: None,
             working_frame: true,
         }
@@ -1217,7 +1247,7 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
             display.status.symbol(display.working_frame)
         ),
         "--token".to_owned(),
-        format!("sort_rank={}", sort_rank(&SORT_ORDER, display.status)),
+        format!("sort_rank={}", sort_rank(&SORT_ORDER, display.sort_key)),
     ]);
     if let Some(elapsed) = &display.elapsed {
         args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]);
@@ -1679,17 +1709,23 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
 
     /// A hook signal is a fact about a tool call; a semantic verdict is an
     /// inference. The fact wins, and once the hook says the interaction ended
-    /// only a newer inference may speak.
-    fn resolve_attention(&self, pane: &Pane) -> Option<Attention> {
+    /// only a newer inference may speak. The flag records which side spoke so
+    /// the ordering can trust a fact more than an inference.
+    fn resolve_attention(&self, pane: &Pane) -> Option<(Attention, AttentionSource)> {
         let persisted = self.display_states.panes.get(&pane.id);
+        let semantic = |state: &PersistedDisplayState| {
+            state
+                .semantic_attention
+                .map(|attention| (attention, AttentionSource::Semantic))
+        };
         match self.hook_states.panes.get(&pane.id) {
             Some(hook) => match hook.attention {
-                Some(attention) => Some(attention),
+                Some(attention) => Some((attention, AttentionSource::Hook)),
                 None => persisted
                     .filter(|state| state.analysis_unix_ms > hook.updated_unix_ms)
-                    .and_then(|state| state.semantic_attention),
+                    .and_then(semantic),
             },
-            None => persisted.and_then(|state| state.semantic_attention),
+            None => persisted.and_then(semantic),
         }
     }
 
@@ -1711,13 +1747,30 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
     }
 
     fn display_for(&self, pane: &Pane) -> Result<Display> {
+        let attention = self.resolve_attention(pane);
+        let sort_key = match attention {
+            Some((Attention::Question, AttentionSource::Hook)) => SortKey::Question,
+            Some((Attention::Question, AttentionSource::Semantic)) => SortKey::SemanticQuestion,
+            Some((Attention::Approval, _)) => SortKey::Approval,
+            Some((Attention::Error, _)) => SortKey::Error,
+            // A natively blocked pane is stalled on the user as surely as a
+            // hook signal, just without the reason.
+            None => match pane.agent_status.as_str() {
+                "blocked" => SortKey::Question,
+                "working" => SortKey::Working,
+                "done" => SortKey::Done,
+                "idle" => SortKey::Idle,
+                _ => SortKey::Stale,
+            },
+        };
         Ok(Display {
             summary: self
                 .display_states
                 .panes
                 .get(&pane.id)
                 .and_then(|state| state.summary.clone()),
-            status: status_icon(&pane.agent_status, self.resolve_attention(pane)),
+            status: status_icon(&pane.agent_status, attention.map(|(kind, _)| kind)),
+            sort_key,
             elapsed: self.elapsed_for(pane)?,
             working_frame: self.working_frame,
         })
