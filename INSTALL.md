@@ -49,11 +49,11 @@ agent_panel_sort = "priority"
 rows = [
   [
     { token = "$status_question_new", fg = "#f9e2af", bold = true },
-    { token = "$status_question", fg = "#9a8d68", bold = true },
+    { token = "$status_question", fg = "#6c7086", bold = true },
     { token = "$status_approval_new", fg = "#fab387", bold = true },
-    { token = "$status_approval", fg = "#9c7458", bold = true },
+    { token = "$status_approval", fg = "#6c7086", bold = true },
     { token = "$status_error_new", fg = "#f38ba8", bold = true },
-    { token = "$status_error", fg = "#96586c", bold = true },
+    { token = "$status_error", fg = "#6c7086", bold = true },
     { token = "$status_working", fg = "#a6e3a1", bold = true },
     { token = "$status_done", fg = "#a6e3a1", bold = true },
     { token = "$status_interrupted", fg = "#cba6f7", bold = true },

@@ -1304,7 +1304,13 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
             display.status.symbol(display.working_frame)
         ),
         "--token".to_owned(),
-        format!("sort_rank={}", sort_rank(&SORT_ORDER, display.sort_key)),
+        // Two characters: unseen panes partition above seen ones, then the
+        // attention rank orders within each partition.
+        format!(
+            "sort_rank={}{}",
+            if display.unseen { '0' } else { '1' },
+            sort_rank(&SORT_ORDER, display.sort_key)
+        ),
     ]);
     match &display.elapsed {
         Some(elapsed) => args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]),
@@ -1977,8 +1983,6 @@ pub fn apply_priority_agent_view(home: &Path) -> Result<()> {
             "label": "attention priority",
             "sort": [
                 {"field": {"token": "sort_rank"}, "order": "asc"},
-                // Within a rank, panes the user has not viewed yet come first.
-                {"field": "seen", "order": "asc"},
                 {"field": "state_change_seq", "order": "desc"},
             ],
         },
