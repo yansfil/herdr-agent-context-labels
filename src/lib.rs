@@ -211,10 +211,13 @@ static SORT_ORDER: LazyLock<[SortKey; 9]> = LazyLock::new(|| {
 
 /// Every status token this plugin may own. The watcher clears the whole set on
 /// each report so exactly one of them is ever live for a pane.
-const STATUS_TOKENS: [&str; 8] = [
+const STATUS_TOKENS: [&str; 11] = [
     "status_question",
+    "status_question_new",
     "status_approval",
+    "status_approval_new",
     "status_error",
+    "status_error_new",
     "status_working",
     "status_done",
     "status_interrupted",
@@ -1286,19 +1289,24 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
     ]) {
         args.extend(["--clear-token".to_owned(), token.to_owned()]);
     }
+    // Attention states carry a `_new` variant while unfocused since the last
+    // change, so the user's config can color an unread question differently
+    // from one already looked at.
+    let status_token = match (display.unseen, display.status) {
+        (true, StatusIcon::Question) => "status_question_new",
+        (true, StatusIcon::Approval) => "status_approval_new",
+        (true, StatusIcon::Error) => "status_error_new",
+        _ => display.status.token_name(),
+    };
     args.extend([
         "--token".to_owned(),
         format!(
-            "{}={}",
-            display.status.token_name(),
+            "{status_token}={}",
             display.status.symbol(display.working_frame)
         ),
         "--token".to_owned(),
         format!("sort_rank={}", sort_rank(&SORT_ORDER, display.sort_key)),
     ]);
-    if display.unseen {
-        args.extend(["--token".to_owned(), "unseen=•".to_owned()]);
-    }
     if let Some(elapsed) = &display.elapsed {
         args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]);
     }
