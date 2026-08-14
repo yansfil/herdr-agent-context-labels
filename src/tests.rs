@@ -59,6 +59,21 @@ fn agent_list_payload_from_a_live_session_parses_without_a_second_endpoint() {
     assert_eq!(panes.iter().filter(|pane| pane.focused).count(), 1);
 }
 
+#[test]
+fn mirror_panes_are_excluded_so_the_remote_watcher_keeps_its_tokens() {
+    let item: AgentListItem = serde_json::from_value(serde_json::json!({
+        "pane_id": "wD:p3",
+        "agent": "claude",
+        "agent_status": "idle",
+        "revision": 320,
+        "state_change_seq": 570,
+        "cwd": "/Users/example/.local/state/herdr-mirror/.mirror-pane",
+        "focused": false
+    }))
+    .unwrap();
+    assert!(item.into_pane().is_none());
+}
+
 // ---------------------------------------------------------------- AC2
 
 #[test]
