@@ -62,6 +62,7 @@ pub enum StatusIcon {
     Error,
     Working,
     Done,
+    Interrupted,
     Idle,
     #[default]
     Stale,
@@ -76,6 +77,7 @@ impl StatusIcon {
             Self::Working if working_frame => "●",
             Self::Working => "○",
             Self::Done => "●",
+            Self::Interrupted => "‖",
             Self::Idle => "○",
             Self::Stale => "~",
         }
@@ -88,6 +90,7 @@ impl StatusIcon {
             Self::Error => "status_error",
             Self::Working => "status_working",
             Self::Done => "status_done",
+            Self::Interrupted => "status_interrupted",
             Self::Idle => "status_idle",
             Self::Stale => "status_stale",
         }
@@ -105,6 +108,7 @@ pub enum SortKey {
     Error,
     Done,
     Working,
+    Interrupted,
     Idle,
     Stale,
 }
@@ -119,6 +123,7 @@ impl SortKey {
             Self::Error => "error",
             Self::Working => "working",
             Self::Done => "done",
+            Self::Interrupted => "interrupted",
             Self::Idle => "idle",
             Self::Stale => "stale",
         }
@@ -128,13 +133,14 @@ impl SortKey {
 /// Attention-first default: hook-confirmed interaction states, then the
 /// provider-inferred question, then error, an unseen completion, and the
 /// ambient states.
-pub const DEFAULT_SORT_ORDER: [SortKey; 8] = [
+pub const DEFAULT_SORT_ORDER: [SortKey; 9] = [
     SortKey::Question,
     SortKey::Approval,
     SortKey::SemanticQuestion,
     SortKey::Error,
     SortKey::Done,
     SortKey::Working,
+    SortKey::Interrupted,
     SortKey::Idle,
     SortKey::Stale,
 ];
@@ -147,7 +153,7 @@ pub const SORT_ORDER_FILE: &str = "sort-order.json";
 /// Turn an optional user order into a complete one: listed names first in the
 /// given order, unknown names ignored, missing states appended in default
 /// order. Invalid JSON keeps the default rather than failing the watcher.
-pub fn resolve_sort_order(raw: Option<&str>) -> [SortKey; 8] {
+pub fn resolve_sort_order(raw: Option<&str>) -> [SortKey; 9] {
     let Some(raw) = raw else {
         return DEFAULT_SORT_ORDER;
     };
@@ -180,7 +186,7 @@ pub fn resolve_sort_order(raw: Option<&str>) -> [SortKey; 8] {
 
 /// One digit per state so the token sort's string comparison matches the
 /// numeric order.
-pub fn sort_rank(order: &[SortKey; 8], status: SortKey) -> String {
+pub fn sort_rank(order: &[SortKey; 9], status: SortKey) -> String {
     let position = order
         .iter()
         .position(|icon| *icon == status)
@@ -190,7 +196,7 @@ pub fn sort_rank(order: &[SortKey; 8], status: SortKey) -> String {
 
 /// Resolved once per process: the watcher reports every rank, so a mid-run
 /// edit takes effect on the next watcher start, like the agent view itself.
-static SORT_ORDER: LazyLock<[SortKey; 8]> = LazyLock::new(|| {
+static SORT_ORDER: LazyLock<[SortKey; 9]> = LazyLock::new(|| {
     let path = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -205,12 +211,13 @@ static SORT_ORDER: LazyLock<[SortKey; 8]> = LazyLock::new(|| {
 
 /// Every status token this plugin may own. The watcher clears the whole set on
 /// each report so exactly one of them is ever live for a pane.
-const STATUS_TOKENS: [&str; 7] = [
+const STATUS_TOKENS: [&str; 8] = [
     "status_question",
     "status_approval",
     "status_error",
     "status_working",
     "status_done",
+    "status_interrupted",
     "status_idle",
     "status_stale",
 ];
@@ -924,6 +931,10 @@ struct PersistedDisplayState {
     analysis_unix_ms: u64,
     #[serde(default)]
     analysis_fingerprint: Option<u64>,
+    /// The user tore the last turn down mid-run; shown as its own status until
+    /// the pane works again.
+    #[serde(default)]
+    interrupted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1562,11 +1573,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 });
             let context = analysis_context(&parsed.events);
             state.analysis_fingerprint = Some(context_fingerprint(&context));
-            if let Some(summary) = &state.summary
-                && !summary.starts_with("⏸")
-            {
-                state.summary = Some(format!("⏸ {summary}"));
-            }
+            state.interrupted = true;
             write_state_json(
                 &self.paths.display_state(),
                 &self.display_states,
@@ -1683,9 +1690,14 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             changed = true;
         }
         // A running agent is not waiting on anyone, so an older verdict about
-        // attention is stale by definition.
+        // attention is stale by definition. The same run also ends any
+        // interrupted display: the user has resumed the pane.
         if pane.agent_status == "working" && state.semantic_attention.is_some() {
             state.semantic_attention = None;
+            changed = true;
+        }
+        if pane.agent_status == "working" && state.interrupted {
+            state.interrupted = false;
             changed = true;
         }
         if !changed {
@@ -1764,6 +1776,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             });
         state.summary = Some(analysis.summary.clone());
         state.semantic_attention = analysis.attention;
+        state.interrupted = false;
         state.analysis_fingerprint = Some(fingerprint);
         state.analysis_unix_ms = now;
         write_state_json(
@@ -1824,6 +1837,26 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
 
     fn display_for(&self, pane: &Pane) -> Result<Display> {
         let attention = self.resolve_attention(pane);
+        let interrupted = attention.is_none()
+            && matches!(pane.agent_status.as_str(), "idle" | "done")
+            && self
+                .display_states
+                .panes
+                .get(&pane.id)
+                .is_some_and(|state| state.interrupted);
+        if interrupted {
+            return Ok(Display {
+                summary: self
+                    .display_states
+                    .panes
+                    .get(&pane.id)
+                    .and_then(|state| state.summary.clone()),
+                status: StatusIcon::Interrupted,
+                sort_key: SortKey::Interrupted,
+                elapsed: self.elapsed_for(pane)?,
+                working_frame: self.working_frame,
+            });
+        }
         let sort_key = match attention {
             Some((Attention::Question, AttentionSource::Hook)) => SortKey::Question,
             Some((Attention::Question, AttentionSource::Semantic)) => SortKey::SemanticQuestion,

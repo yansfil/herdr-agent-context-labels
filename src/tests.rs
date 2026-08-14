@@ -869,7 +869,7 @@ fn elapsed_time_uses_compact_second_minute_hour_and_day_units() {
 fn sort_rank_orders_user_blocking_states_before_ambient_states() {
     let order = resolve_sort_order(None);
     let ranks = DEFAULT_SORT_ORDER.map(|icon| sort_rank(&order, icon));
-    assert_eq!(ranks, ["0", "1", "2", "3", "4", "5", "6", "7"]);
+    assert_eq!(ranks, ["0", "1", "2", "3", "4", "5", "6", "7", "8"]);
     // The hook-confirmed question outranks the provider-inferred one.
     assert!(sort_rank(&order, SortKey::Question) < sort_rank(&order, SortKey::SemanticQuestion));
 }
@@ -881,7 +881,7 @@ fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
     assert_eq!(order[1], SortKey::Question);
     // Unlisted states keep their default relative order after the listed ones.
     assert_eq!(order[2], SortKey::Approval);
-    assert_eq!(order[7], SortKey::Stale);
+    assert_eq!(order[8], SortKey::Stale);
     // Broken JSON must not take the watcher down or scramble the order.
     assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);
 }

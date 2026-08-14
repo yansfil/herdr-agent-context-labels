@@ -55,6 +55,7 @@ Native hook state wins over semantic question detection, and both win over the o
 | `×` | The agent stopped with an error. |
 | `○` / `●` | The agent is working and the symbol is animating. |
 | `●` | Background work finished and Herdr reports it as unseen. |
+| `‖` | The user interrupted the last turn; clears when the pane works again. |
 | `○` | The pane is idle and has been seen. |
 | `~` | Herdr cannot classify the current lifecycle state confidently. |
 

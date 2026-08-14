@@ -53,6 +53,7 @@ rows = [
     { token = "$status_error", fg = "#f38ba8", bold = true },
     { token = "$status_working", fg = "#a6e3a1", bold = true },
     { token = "$status_done", fg = "#a6e3a1", bold = true },
+    { token = "$status_interrupted", fg = "#cba6f7", bold = true },
     { token = "$status_idle", fg = "#a6adc8", bold = true },
     { token = "$status_stale", fg = "#6c7086", bold = true },
     "workspace",
