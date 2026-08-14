@@ -459,6 +459,15 @@ fn parses_the_provider_structured_output_contract() {
             .attention,
         Some(Attention::Question)
     );
+    // The rationale field is accepted and discarded, with or without it.
+    assert_eq!(
+        parse_analysis(
+            r#"{"reason":"선택을 요구함","summary":"배포 진행 여부 확인","attention":"question"}"#
+        )
+        .unwrap()
+        .attention,
+        Some(Attention::Question)
+    );
     assert!(parse_analysis(r#"{"summary":"작업 승인","attention":"approval"}"#).is_err());
     assert!(parse_analysis(r#"{"summary":"상태 없는 응답"}"#).is_err());
 }
