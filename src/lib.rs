@@ -1305,10 +1305,15 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
         ),
         "--token".to_owned(),
         // Two characters: unseen panes partition above seen ones, then the
-        // attention rank orders within each partition.
+        // attention rank orders within each partition. A running pane ignores
+        // the partition: active work always sorts with the unseen group.
         format!(
             "sort_rank={}{}",
-            if display.unseen { '0' } else { '1' },
+            if display.unseen || display.status == StatusIcon::Working {
+                '0'
+            } else {
+                '1'
+            },
             sort_rank(&SORT_ORDER, display.sort_key)
         ),
     ]);
