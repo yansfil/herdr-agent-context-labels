@@ -256,12 +256,9 @@ fn done_status_comes_from_herdr() {
     assert_eq!(status_icon("done", None), StatusIcon::Done);
     assert_eq!(status_icon("idle", None), StatusIcon::Idle);
     assert_eq!(status_icon("working", None), StatusIcon::Working);
-    assert_eq!(status_icon("blocked", None), StatusIcon::Question);
+    // Herdr already knows a dialog is waiting for a key; that is `!`, not `?`.
+    assert_eq!(status_icon("blocked", None), StatusIcon::Approval);
     assert_eq!(status_icon("unknown", None), StatusIcon::Stale);
-    assert_eq!(
-        status_icon("working", Some(Attention::Error)),
-        StatusIcon::Error
-    );
     assert_eq!(StatusIcon::Working.symbol(true), "●");
     assert_eq!(StatusIcon::Working.symbol(false), "○");
 
@@ -282,6 +279,81 @@ fn done_status_comes_from_herdr() {
     watcher.transport.panes[0].state_change_seq = 2;
     watcher.scan().unwrap();
     assert_eq!(watcher.last_report().status, StatusIcon::Done);
+
+    watcher.transport.panes[0].agent_status = "idle".to_owned();
+    watcher.transport.panes[0].state_change_seq = 3;
+    watcher.scan().unwrap();
+    assert_eq!(watcher.last_report().status, StatusIcon::Idle);
+}
+
+#[test]
+fn attention_refines_the_herdr_state_instead_of_replacing_it() {
+    // Herdr's own lifecycle is the base and is never overwritten by the two
+    // things the plugin adds on top of it.
+    for status in ["idle", "done", "blocked", "unknown"] {
+        assert_eq!(
+            status_icon(status, Some(Attention::Question)),
+            StatusIcon::Question,
+            "{status} should accept a question refinement"
+        );
+        assert_eq!(
+            status_icon(status, Some(Attention::Error)),
+            StatusIcon::Error,
+            "{status} should accept an error refinement"
+        );
+    }
+
+    // A running agent is waiting on nobody, so nothing refines it. Without this
+    // guard a verdict drawn one turn ago repaints a pane that has moved on.
+    assert_eq!(
+        status_icon("working", Some(Attention::Question)),
+        StatusIcon::Working
+    );
+    assert_eq!(
+        status_icon("working", Some(Attention::Error)),
+        StatusIcon::Working
+    );
+    assert_eq!(
+        status_icon("working", Some(Attention::Approval)),
+        StatusIcon::Working
+    );
+
+    // The hook sees a permission request before Herdr sees the dialog on screen.
+    assert_eq!(
+        status_icon("idle", Some(Attention::Approval)),
+        StatusIcon::Approval
+    );
+    // `?` and `!` answer different questions: one needs your words, the other
+    // needs a keypress.
+    assert_eq!(StatusIcon::Question.symbol(true), "?");
+    assert_eq!(StatusIcon::Approval.symbol(true), "!");
+}
+
+#[test]
+fn a_failed_turn_is_retired_once_the_agent_runs_again() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+    let failure = serde_json::json!({ "hook_event_name": "StopFailure" });
+    assert_eq!(
+        apply_hook_payload(&paths, "w1:p1", &failure).unwrap(),
+        HookUpdate::Set(Attention::Error)
+    );
+
+    let mut watcher = Watcher::<_, FakeClient, _>::new(
+        FakeTransport::new(vec![pane("w1:p1", AgentKind::Claude, "idle")]),
+        None,
+        FakeSessionReader,
+        paths.clone(),
+    );
+    watcher.scan().unwrap();
+    assert_eq!(watcher.last_report().status, StatusIcon::Error);
+
+    // The agent picked the work back up, so the old failure is history.
+    watcher.transport.panes[0].agent_status = "working".to_owned();
+    watcher.transport.panes[0].state_change_seq = 2;
+    watcher.scan().unwrap();
+    assert_eq!(watcher.last_report().status, StatusIcon::Working);
+    assert_eq!(load_hook_states(&paths).panes["w1:p1"].attention, None);
 
     watcher.transport.panes[0].agent_status = "idle".to_owned();
     watcher.transport.panes[0].state_change_seq = 3;

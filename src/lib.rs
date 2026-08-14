@@ -53,7 +53,6 @@ pub enum Attention {
     Question,
     Approval,
     Error,
-    Stale,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -253,20 +252,30 @@ enum ProviderAttention {
     None,
 }
 
-/// Herdr owns the lifecycle; attention is what this plugin adds on top.
+/// Herdr owns the lifecycle and is trusted for it outright. This plugin only
+/// refines what Herdr cannot see from the screen: whether a stopped agent is
+/// waiting for an answer rather than a keypress, and whether a turn ended in an
+/// error. The base state is never replaced by an inference.
 pub fn status_icon(agent_status: &str, attention: Option<Attention>) -> StatusIcon {
+    let base = match agent_status {
+        "working" => StatusIcon::Working,
+        // Herdr reports blocked when a dialog is on screen waiting for a key.
+        "blocked" => StatusIcon::Approval,
+        "done" => StatusIcon::Done,
+        "idle" => StatusIcon::Idle,
+        _ => StatusIcon::Stale,
+    };
+    // A running agent is not waiting on anyone and has not stopped to fail.
+    if base == StatusIcon::Working {
+        return base;
+    }
     match attention {
-        Some(Attention::Question) => StatusIcon::Question,
-        Some(Attention::Approval) => StatusIcon::Approval,
         Some(Attention::Error) => StatusIcon::Error,
-        Some(Attention::Stale) => StatusIcon::Stale,
-        None => match agent_status {
-            "working" => StatusIcon::Working,
-            "done" => StatusIcon::Done,
-            "idle" => StatusIcon::Idle,
-            "blocked" => StatusIcon::Question,
-            _ => StatusIcon::Stale,
-        },
+        // Either a question tool the hook saw, or plain prose the provider read.
+        Some(Attention::Question) => StatusIcon::Question,
+        // The hook can see a permission request before Herdr sees the dialog.
+        Some(Attention::Approval) => StatusIcon::Approval,
+        None => base,
     }
 }
 
@@ -1516,35 +1525,42 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
         Ok(true)
     }
 
-    /// A permission dialog that is dismissed without a completion hook would
-    /// otherwise leave its attention pinned forever.
+    /// Retire a hook signal that the lifecycle has since overtaken. A dialog
+    /// dismissed without a completion hook, or a failed turn the agent has
+    /// already moved on from, would otherwise stay pinned forever.
     fn sync_hook_lifecycle(&mut self, pane: &Pane) -> Result<()> {
+        enum Change {
+            /// The dialog is on screen; arm the retirement for when it leaves.
+            Observe,
+            Retire,
+        }
         let Some(state) = self.hook_states.panes.get(&pane.id) else {
             return Ok(());
         };
-        if !matches!(
-            state.attention,
-            Some(Attention::Question | Attention::Approval)
-        ) {
-            return Ok(());
-        }
         let blocked = pane.agent_status == "blocked";
-        if blocked == state.observed_blocked {
-            return Ok(());
-        }
+        let change = match state.attention {
+            Some(Attention::Question | Attention::Approval)
+                if blocked != state.observed_blocked =>
+            {
+                if blocked { Change::Observe } else { Change::Retire }
+            }
+            Some(Attention::Error) if pane.agent_status == "working" => Change::Retire,
+            _ => return Ok(()),
+        };
         fs::create_dir_all(&self.paths.root)?;
         let _lock = locked_state_file(&self.paths.hook_state_lock())?;
         let mut states = load_hook_states(&self.paths);
         let Some(state) = states.panes.get_mut(&pane.id) else {
             return Ok(());
         };
-        if blocked {
-            state.observed_blocked = true;
-        } else {
-            state.attention = None;
-            state.pending_tool_id = None;
-            state.observed_blocked = false;
-            state.updated_unix_ms = unix_time_ms()?;
+        match change {
+            Change::Observe => state.observed_blocked = true,
+            Change::Retire => {
+                state.attention = None;
+                state.pending_tool_id = None;
+                state.observed_blocked = false;
+                state.updated_unix_ms = unix_time_ms()?;
+            }
         }
         write_state_json(&self.paths.hook_state(), &states, "hook-state")?;
         self.hook_states = states;
