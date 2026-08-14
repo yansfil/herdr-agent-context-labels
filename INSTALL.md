@@ -56,6 +56,7 @@ rows = [
     { token = "$status_interrupted", fg = "#cba6f7", bold = true },
     { token = "$status_idle", fg = "#a6adc8", bold = true },
     { token = "$status_stale", fg = "#6c7086", bold = true },
+    { token = "$unseen", fg = "#f38ba8", bold = true },
     "workspace",
     { token = "$agent_codex", fg = "#89b4fa", bold = true },
     { token = "$agent_claude", fg = "#fab387", bold = true },

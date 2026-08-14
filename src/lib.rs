@@ -347,6 +347,7 @@ pub struct Display {
     pub sort_key: SortKey,
     pub elapsed: Option<String>,
     pub working_frame: bool,
+    pub unseen: bool,
 }
 
 impl Default for Display {
@@ -357,6 +358,7 @@ impl Default for Display {
             sort_key: SortKey::Stale,
             elapsed: None,
             working_frame: true,
+            unseen: false,
         }
     }
 }
@@ -948,6 +950,10 @@ struct PersistedDisplayState {
     /// the pane works again.
     #[serde(default)]
     interrupted: bool,
+    /// The pane changed state and has not been focused since. Approximates
+    /// Herdr's `seen`, which the socket API does not expose to readers.
+    #[serde(default)]
+    unseen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1271,12 +1277,13 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
     if let Some(summary) = &display.summary {
         args.extend(["--token".to_owned(), format!("summary={summary}")]);
     }
-    for token in
-        STATUS_TOKENS
-            .iter()
-            .copied()
-            .chain(["elapsed", "agent_codex", "agent_claude", "sort_rank"])
-    {
+    for token in STATUS_TOKENS.iter().copied().chain([
+        "elapsed",
+        "agent_codex",
+        "agent_claude",
+        "sort_rank",
+        "unseen",
+    ]) {
         args.extend(["--clear-token".to_owned(), token.to_owned()]);
     }
     args.extend([
@@ -1289,6 +1296,9 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
         "--token".to_owned(),
         format!("sort_rank={}", sort_rank(&SORT_ORDER, display.sort_key)),
     ]);
+    if display.unseen {
+        args.extend(["--token".to_owned(), "unseen=•".to_owned()]);
+    }
     if let Some(elapsed) = &display.elapsed {
         args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]);
     }
@@ -1700,6 +1710,12 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
         if state.state_change_seq != pane.state_change_seq {
             state.state_change_seq = pane.state_change_seq;
             state.changed_unix_ms = now;
+            state.unseen = !pane.focused;
+            changed = true;
+        }
+        // Focusing the pane is the act of looking at it.
+        if pane.focused && state.unseen {
+            state.unseen = false;
             changed = true;
         }
         // A running agent is not waiting on anyone, so an older verdict about
@@ -1857,6 +1873,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 .panes
                 .get(&pane.id)
                 .is_some_and(|state| state.interrupted);
+        let unseen = self
+            .display_states
+            .panes
+            .get(&pane.id)
+            .is_some_and(|state| state.unseen);
         if interrupted {
             return Ok(Display {
                 summary: self
@@ -1868,6 +1889,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 sort_key: SortKey::Interrupted,
                 elapsed: self.elapsed_for(pane)?,
                 working_frame: self.working_frame,
+                unseen,
             });
         }
         let sort_key = match attention {
@@ -1895,6 +1917,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             sort_key,
             elapsed: self.elapsed_for(pane)?,
             working_frame: self.working_frame,
+            unseen,
         })
     }
 
