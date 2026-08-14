@@ -465,20 +465,31 @@ fn parses_the_provider_structured_output_contract() {
             attention: None,
         }
     );
+    // A bare question verdict with no expected_reply field carries no statable
+    // user action, so it downgrades like an empty one.
     assert_eq!(
         parse_analysis(r#"{"summary":"음료 소비량 퀴즈 풀이","attention":"question"}"#)
             .unwrap()
             .attention,
-        Some(Attention::Question)
+        None
     );
-    // The rationale field is accepted and discarded, with or without it.
+    // A question verdict needs a statable user action to survive.
     assert_eq!(
         parse_analysis(
-            r#"{"reason":"선택을 요구함","summary":"배포 진행 여부 확인","attention":"question"}"#
+            r#"{"expected_reply":"배포 진행 여부를 답한다","summary":"배포 진행 여부 확인","attention":"question"}"#
         )
         .unwrap()
         .attention,
         Some(Attention::Question)
+    );
+    // Question without an expected reply is a surface match and is downgraded.
+    assert_eq!(
+        parse_analysis(
+            r#"{"expected_reply":"","summary":"새 작업 지시 대기","attention":"question"}"#
+        )
+        .unwrap()
+        .attention,
+        None
     );
     assert!(parse_analysis(r#"{"summary":"작업 승인","attention":"approval"}"#).is_err());
     assert!(parse_analysis(r#"{"summary":"상태 없는 응답"}"#).is_err());

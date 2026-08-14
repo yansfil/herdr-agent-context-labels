@@ -33,6 +33,9 @@ enum Action {
     Hook,
     /// Make exactly one synthetic, sanitized provider request without touching a pane.
     VerifyLiveProvider,
+    /// Classify a transcript from stdin with the live provider and print the
+    /// verdict. Evaluation aid; touches no pane state.
+    AnalyzeStdin,
 }
 
 fn home_directory() -> Result<PathBuf> {
@@ -124,6 +127,25 @@ fn main() -> Result<()> {
             let payload: serde_json::Value =
                 serde_json::from_str(&input).context("hook payload is invalid")?;
             apply_hook_payload(&paths, &pane_id, &payload)?;
+            Ok(())
+        }
+        Action::AnalyzeStdin => {
+            let client = OpenRouterClient::from_environment()
+                .context("OPENROUTER_API_KEY is unavailable or invalid")?;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .context("cannot read transcript")?;
+            let analysis = client.analyze(input.trim())?;
+            println!(
+                "attention={} summary={}",
+                if analysis.attention.is_some() {
+                    "question"
+                } else {
+                    "none"
+                },
+                analysis.summary
+            );
             Ok(())
         }
         Action::VerifyLiveProvider => {
