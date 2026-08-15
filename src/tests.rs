@@ -994,6 +994,58 @@ impl SessionReader for FakeSessionReader {
     }
 }
 
+/// A failure that repeats for the same input must stop being re-asked. Two idle
+/// panes once spent 1520 provider calls overnight on a context that could never
+/// succeed, which exhausted the daily budget before anyone was awake.
+#[test]
+fn a_repeating_failure_is_abandoned_instead_of_retried_forever() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+    let mut focused = pane("w1:p9", AgentKind::Claude, "idle");
+    focused.focused = true;
+    let mut watcher = Watcher::new(
+        FakeTransport::new(vec![focused]),
+        Some(MalformedClient),
+        FakeSessionReader,
+        paths.clone(),
+    );
+
+    // A refresh forces an attempt through immediately, standing in for the
+    // wall-clock backoff the watch loop would otherwise wait out. Two of them
+    // reach the cap for a failure that cannot change on its own.
+    for _ in 0..PROVIDER_MAX_ATTEMPTS_TERMINAL {
+        request_refresh(&paths).unwrap();
+        watcher.scan().unwrap();
+        watcher.await_pending_analysis();
+        watcher.scan().unwrap();
+    }
+    // From here nobody asks for anything, and the watcher must stay quiet
+    // rather than rediscovering the same failure on every poll.
+    for _ in 0..8 {
+        watcher.scan().unwrap();
+        watcher.await_pending_analysis();
+        watcher.scan().unwrap();
+    }
+
+    let log = fs::read_to_string(paths.log()).unwrap();
+    let attempts = log.matches("provider_invalid_analysis").count();
+    assert_eq!(
+        attempts, PROVIDER_MAX_ATTEMPTS_TERMINAL as usize,
+        "a settled failure retried {attempts} times: {log}"
+    );
+    assert!(log.contains("analysis_abandoned"), "log was: {log}");
+    // Abandoning is not a verdict: nothing is claimed about the pane.
+    assert!(!log.contains("attention="), "log was: {log}");
+}
+
+struct MalformedClient;
+
+impl AnalysisClient for MalformedClient {
+    fn analyze(&self, _: &str) -> Result<Analysis> {
+        Err(anyhow::anyhow!("provider_invalid_analysis: expected value"))
+    }
+}
+
 struct StateSequenceReader;
 
 impl SessionReader for StateSequenceReader {

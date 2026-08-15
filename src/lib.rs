@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PLUGIN_ID: &str = "herdr-agent-context-labels";
-pub const MODEL: &str = "nvidia/nemotron-3-super-120b-a12b:free";
+pub const MODEL: &str = "openai/gpt-5.6-luna";
 /// Upper bound on the analysis context. The context normally spans the last
 /// user turn; this only guards against one enormous turn.
 pub const MAX_ANALYSIS_CONTEXT_CHARS: usize = 4_000;
@@ -24,6 +24,17 @@ pub const SESSION_TAIL_BYTES: u64 = 256 * 1024;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(750);
 pub const PROVIDER_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 pub const PROVIDER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// A failure is not a verdict, so the same context is asked again rather than
+/// leaving the pane silently unlabelled. The retry must still end: at a flat
+/// five seconds two untouched panes once spent 1520 calls overnight re-asking a
+/// question that could not succeed, which exhausted the day's budget by 01:11.
+pub const PROVIDER_MAX_ATTEMPTS_TRANSIENT: u8 = 4;
+/// A malformed body or a 404 repeats for the same input, so a second attempt is
+/// the most that can ever help.
+pub const PROVIDER_MAX_ATTEMPTS_TERMINAL: u8 = 2;
+/// A rate limit is a fact about the account, not about one pane, so every pane
+/// waits together instead of each discovering it alone.
+pub const PROVIDER_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 pub const DAILY_REQUEST_LIMIT: u16 = 1000;
 /// Day directories scanned when Herdr has not reported a Codex session yet.
 const CODEX_FALLBACK_DAYS: usize = 7;
@@ -1382,6 +1393,12 @@ impl AnalysisClient for OpenRouterClient {
         let body = serde_json::json!({
             "model": MODEL,
             "temperature": 0,
+            // The model reasons before answering unless told not to, and the
+            // reserved 96 tokens are then spent entirely on that reasoning:
+            // the body comes back null with finish_reason "length". This is a
+            // one-line classification, so the reasoning buys nothing and costs
+            // both the answer and roughly triple the tokens.
+            "reasoning": {"enabled": false},
             "max_tokens": 96,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -1443,6 +1460,15 @@ fn provider_transport_error(error: ureq::Error) -> anyhow::Error {
     anyhow!("provider_request_failed_{kind}")
 }
 
+/// Transient means the same request could still succeed unchanged; anything
+/// else is settled by the input and only wastes budget when repeated.
+fn provider_failure_is_transient(code: &str) -> bool {
+    if let Some(status) = code.strip_prefix("provider_http_") {
+        return status.starts_with('5') || matches!(status, "408" | "409" | "425" | "429");
+    }
+    code.starts_with("provider_request_failed")
+}
+
 struct AnalysisOutcome {
     pane_id: String,
     fingerprint: u64,
@@ -1461,6 +1487,11 @@ pub struct Watcher<T: HerdrTransport, C: AnalysisClient, R: SessionReader> {
     state_change_seqs: HashMap<String, u64>,
     reported_revisions: HashMap<String, u64>,
     next_analysis_at: HashMap<String, SystemTime>,
+    /// Consecutive failures for one pane's current context fingerprint. A new
+    /// fingerprint restarts the count, so the cap bounds one context, not a
+    /// pane's whole lifetime.
+    analysis_attempts: HashMap<String, (u64, u8)>,
+    provider_cooldown_until: Option<SystemTime>,
     last_provider_request_at: Option<SystemTime>,
     display_states: DisplayStates,
     last_displays: HashMap<String, Display>,
@@ -1489,6 +1520,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             state_change_seqs: HashMap::new(),
             reported_revisions: HashMap::new(),
             next_analysis_at: HashMap::new(),
+            analysis_attempts: HashMap::new(),
+            provider_cooldown_until: None,
             last_provider_request_at: None,
             display_states,
             last_displays: HashMap::new(),
@@ -1515,6 +1548,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             };
             match outcome.result {
                 Ok(analysis) => {
+                    self.analysis_attempts.remove(&outcome.pane_id);
+                    self.provider_cooldown_until = None;
                     self.record_analysis(
                         pane,
                         &analysis,
@@ -1529,14 +1564,51 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                     }
                 }
                 Err(code) => {
-                    self.next_analysis_at
-                        .insert(pane.id.clone(), SystemTime::now() + PROVIDER_RETRY_INTERVAL);
-                    append_log(
-                        &self.paths,
-                        "analysis_provider_failed",
-                        Some(pane),
-                        Some(&code),
-                    )?;
+                    let transient = provider_failure_is_transient(&code);
+                    let limit = if transient {
+                        PROVIDER_MAX_ATTEMPTS_TRANSIENT
+                    } else {
+                        PROVIDER_MAX_ATTEMPTS_TERMINAL
+                    };
+                    let attempts = match self.analysis_attempts.get_mut(&outcome.pane_id) {
+                        Some(entry) if entry.0 == outcome.fingerprint => {
+                            entry.1 = entry.1.saturating_add(1);
+                            entry.1
+                        }
+                        _ => {
+                            self.analysis_attempts
+                                .insert(outcome.pane_id.clone(), (outcome.fingerprint, 1));
+                            1
+                        }
+                    };
+                    if code == "provider_http_429" {
+                        self.provider_cooldown_until =
+                            Some(SystemTime::now() + PROVIDER_RATE_LIMIT_COOLDOWN);
+                    }
+                    if attempts >= limit {
+                        // Park this exact context so it is never asked again
+                        // until the pane itself moves on.
+                        self.next_analysis_at.remove(&pane.id);
+                        self.analysis_attempts.remove(&outcome.pane_id);
+                        self.abandon_analysis(pane, outcome.fingerprint)?;
+                        append_log(
+                            &self.paths,
+                            "analysis_abandoned",
+                            Some(pane),
+                            Some(&format!("{code};attempts={attempts}")),
+                        )?;
+                    } else {
+                        let backoff =
+                            PROVIDER_RETRY_INTERVAL * 4u32.pow(u32::from(attempts.min(4) - 1));
+                        self.next_analysis_at
+                            .insert(pane.id.clone(), SystemTime::now() + backoff);
+                        append_log(
+                            &self.paths,
+                            "analysis_provider_failed",
+                            Some(pane),
+                            Some(&format!("{code};attempt={attempts}")),
+                        )?;
+                    }
                 }
             }
         }
@@ -1716,7 +1788,28 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             );
             return self.report_if_changed(pane, &display);
         }
+        // The provider asked everyone to stop, so no pane spends a request on
+        // rediscovering that for itself.
+        if let Some(until) = self.provider_cooldown_until {
+            if SystemTime::now() < until {
+                self.next_analysis_at.insert(pane.id.clone(), until);
+                append_log(
+                    &self.paths,
+                    "analysis_skipped_provider_cooldown",
+                    Some(pane),
+                    None,
+                )?;
+                return self.report_if_changed(pane, &display);
+            }
+            self.provider_cooldown_until = None;
+        }
         if !reserve_daily_request(&self.paths)? {
+            // Without a wait the exhausted budget is rediscovered on every poll,
+            // which once wrote 42828 identical lines in a single day.
+            self.next_analysis_at.insert(
+                pane.id.clone(),
+                SystemTime::now() + PROVIDER_RATE_LIMIT_COOLDOWN,
+            );
             append_log(
                 &self.paths,
                 "analysis_skipped_daily_limit",
@@ -1836,6 +1929,28 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
         write_state_json(&self.paths.hook_state(), &states, "hook-state")?;
         self.hook_states = states;
         Ok(())
+    }
+
+    /// Give up on one context without inventing a verdict for it: the summary
+    /// and the attention already on screen stay untouched, and only the
+    /// fingerprint is stored so the deduplication check stops the re-ask.
+    fn abandon_analysis(&mut self, pane: &Pane, fingerprint: u64) -> Result<()> {
+        let now = unix_time_ms()?;
+        let state = self
+            .display_states
+            .panes
+            .entry(pane.id.clone())
+            .or_insert_with(|| PersistedDisplayState {
+                state_change_seq: pane.state_change_seq,
+                changed_unix_ms: now,
+                ..PersistedDisplayState::default()
+            });
+        state.analysis_fingerprint = Some(fingerprint);
+        write_state_json(
+            &self.paths.display_state(),
+            &self.display_states,
+            "display-state",
+        )
     }
 
     fn record_analysis(
