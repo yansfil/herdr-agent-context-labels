@@ -271,8 +271,11 @@ fn done_status_comes_from_herdr() {
     // Herdr already knows a dialog is waiting for a key; that is `!`, not `?`.
     assert_eq!(status_icon("blocked", None), StatusIcon::Approval);
     assert_eq!(status_icon("unknown", None), StatusIcon::Stale);
-    assert_eq!(StatusIcon::Working.symbol(true), "●");
-    assert_eq!(StatusIcon::Working.symbol(false), "○");
+    // Working holds one steady symbol: the blink used to be the only thing
+    // telling it apart from done, and it pulled the eye to the one state that
+    // is not waiting on anyone.
+    assert_eq!(StatusIcon::Working.symbol(), "●");
+    assert_eq!(StatusIcon::Idle.symbol(), "○");
 
     // The plugin keeps no unseen-completion state of its own: a pane reported
     // as done renders done, and the same pane reported as idle renders idle,
@@ -337,8 +340,8 @@ fn attention_refines_the_herdr_state_instead_of_replacing_it() {
     );
     // `?` and `!` answer different questions: one needs your words, the other
     // needs a keypress.
-    assert_eq!(StatusIcon::Question.symbol(true), "?");
-    assert_eq!(StatusIcon::Approval.symbol(true), "!");
+    assert_eq!(StatusIcon::Question.symbol(), "?");
+    assert_eq!(StatusIcon::Approval.symbol(), "!");
 }
 
 #[test]

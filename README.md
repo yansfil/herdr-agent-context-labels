@@ -29,7 +29,7 @@ Each supported pane gets a short task label, lifecycle status, agent kind, and t
 
 - Adds a maximum-30-character task summary to recognized Codex and Claude Code panes.
 - Shows question, approval, error, working, unseen completion, idle, and unknown states as compact symbols.
-- Alternates the working symbol between `○` and `●` without making the row disappear.
+- Holds one steady symbol per state; working is told apart from an unseen completion by color, not by a blink.
 - Shows compact elapsed time such as `12s`, `4m`, `2h`, or `3d`.
 - Keeps completion semantics aligned with Herdr's native `working`, `done`, `idle`, `blocked`, and `unknown` lifecycle states.
 - Uses native agent hooks for high-confidence interaction signals and OpenRouter for task summaries and plain-text question detection.
@@ -53,8 +53,8 @@ Native hook state wins over semantic question detection, and both win over the o
 | `?` | The agent needs an answer from the user. |
 | `!` | The agent is waiting for approval. |
 | `×` | The agent stopped with an error. |
-| `○` / `●` | The agent is working and the symbol is animating. |
-| `●` | Background work finished and Herdr reports it as unseen. |
+| `●` | The agent is working. |
+| `●` | Background work finished and Herdr reports it as unseen. Shares a symbol with working, so give `$status_working` and `$status_done` different colors. |
 | `‖` | The user interrupted the last turn; clears when the pane works again. |
 | `○` | The pane is idle and has been seen. |
 | `~` | Herdr cannot classify the current lifecycle state confidently. |
@@ -121,7 +121,7 @@ rows = [
     { token = "$status_question", fg = "#f9e2af", bold = true },
     { token = "$status_approval", fg = "#fab387", bold = true },
     { token = "$status_error", fg = "#f38ba8", bold = true },
-    { token = "$status_working", fg = "#a6e3a1", bold = true },
+    { token = "$status_working", fg = "#d5a44a", bold = true },
     { token = "$status_done", fg = "#a6e3a1", bold = true },
     { token = "$status_idle", fg = "#a6adc8", bold = true },
     { token = "$status_stale", fg = "#6c7086", bold = true },
@@ -195,9 +195,9 @@ description = "refresh active pane summary"
 ## Summary generation
 
 The watcher requests a new analysis after a supported agent settles and its sanitized session fingerprint changes.
-Slow provider calls run outside the status loop, so lifecycle updates and the working animation continue while a request is in flight.
+Slow provider calls run outside the status loop, so lifecycle and elapsed-time updates continue while a request is in flight.
 
-The fixed model is `poolside/laguna-s-2.1:free` and there is no fallback model.
+The fixed model is `openai/gpt-5.6-luna`, called with reasoning disabled, and there is no fallback model.
 The accepted provider output is exactly one JSON object with these fields:
 
 ```json

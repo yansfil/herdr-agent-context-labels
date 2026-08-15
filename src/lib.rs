@@ -80,13 +80,15 @@ pub enum StatusIcon {
 }
 
 impl StatusIcon {
-    pub const fn symbol(self, working_frame: bool) -> &'static str {
+    pub const fn symbol(self) -> &'static str {
         match self {
             Self::Question => "?",
             Self::Approval => "!",
             Self::Error => "×",
-            Self::Working if working_frame => "●",
-            Self::Working => "○",
+            // Steady, not blinking. A pulse drags the eye toward the one state
+            // that needs nothing from the user, and it was also the only thing
+            // separating working from done while both were painted green.
+            Self::Working => "●",
             Self::Done => "●",
             Self::Interrupted => "‖",
             Self::Idle => "○",
@@ -360,7 +362,6 @@ pub struct Display {
     pub status: StatusIcon,
     pub sort_key: SortKey,
     pub elapsed: Option<String>,
-    pub working_frame: bool,
     pub unseen: bool,
 }
 
@@ -371,7 +372,6 @@ impl Default for Display {
             status: StatusIcon::Stale,
             sort_key: SortKey::Stale,
             elapsed: None,
-            working_frame: true,
             unseen: false,
         }
     }
@@ -1337,10 +1337,7 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
     }
     args.extend([
         "--token".to_owned(),
-        format!(
-            "{status_token}={}",
-            display.status.symbol(display.working_frame)
-        ),
+        format!("{status_token}={}", display.status.symbol()),
         "--token".to_owned(),
         // Two characters: unseen panes partition above seen ones, then the
         // attention rank orders within each partition. A running pane ignores
@@ -1495,7 +1492,6 @@ pub struct Watcher<T: HerdrTransport, C: AnalysisClient, R: SessionReader> {
     last_provider_request_at: Option<SystemTime>,
     display_states: DisplayStates,
     last_displays: HashMap<String, Display>,
-    working_frame: bool,
     last_animation_at: SystemTime,
     analysis_in_flight: HashSet<String>,
     analysis_sender: mpsc::Sender<AnalysisOutcome>,
@@ -1525,7 +1521,6 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             last_provider_request_at: None,
             display_states,
             last_displays: HashMap::new(),
-            working_frame: true,
             last_animation_at: SystemTime::now(),
             analysis_in_flight: HashSet::new(),
             analysis_sender,
@@ -1613,10 +1608,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             }
         }
 
+        // The status symbol no longer animates, but elapsed time still moves,
+        // so the same tick keeps driving a redraw.
         let animation_due =
             self.last_animation_at.elapsed().unwrap_or_default() >= Duration::from_millis(900);
         if animation_due {
-            self.working_frame = !self.working_frame;
             self.last_animation_at = SystemTime::now();
         }
 
@@ -2060,7 +2056,6 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 status: StatusIcon::Interrupted,
                 sort_key: SortKey::Interrupted,
                 elapsed: self.elapsed_for(pane)?,
-                working_frame: self.working_frame,
                 unseen,
             });
         }
@@ -2088,7 +2083,6 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             status: status_icon(&pane.agent_status, attention.map(|(kind, _)| kind)),
             sort_key,
             elapsed: self.elapsed_for(pane)?,
-            working_frame: self.working_frame,
             unseen,
         })
     }
