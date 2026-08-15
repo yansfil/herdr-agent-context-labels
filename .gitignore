@@ -1,4 +1,4 @@
 /target/
 .DS_Store
-# Local requirements and verification pipeline state
-/agents/
+# Runtime state and evidence only; PRDs and the rules ledger are committed.
+/agents/implement/
