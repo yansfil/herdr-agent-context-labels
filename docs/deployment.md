@@ -50,7 +50,7 @@ The startup script reads `OPENROUTER_API_KEY` from the environment, falling back
 ```text
 ~/.local/state/herdr-agent-context-labels/
 ├── events.jsonl        # append-only log; the first place to look
-├── display-state.json  # per-pane summary, verdict, analysis fingerprint
+├── display-state.json  # per-pane summary, verdict, analyzed turn per phase
 ├── usage.json          # {"day": <unix days>, "requests": N} against DAILY_REQUEST_LIMIT
 └── settings.json       # automatic-summaries toggle
 ```

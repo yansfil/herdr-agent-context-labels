@@ -539,6 +539,64 @@ pub fn analysis_context(events: &[SessionEvent]) -> String {
     redact(&strip_code_fences(&transcript))
 }
 
+/// Which of a turn's two boundaries an analysis is answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisPhase {
+    /// The user has just spoken and the agent has not answered yet. Naming the
+    /// task here is what lets a working pane say what it is working on.
+    TurnStart,
+    /// The agent has answered and stopped. Whether it is waiting on the user
+    /// can only be judged once its last word is in.
+    TurnEnd,
+}
+
+impl AnalysisPhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TurnStart => "start",
+            Self::TurnEnd => "end",
+        }
+    }
+}
+
+/// Identity of the turn a transcript is currently in, taken from the user's own
+/// last message.
+///
+/// The trigger used to be the hash of the whole context window, which grows
+/// with every token the agent emits: a live pane therefore had a permanently
+/// changing key and asked the provider again on almost every poll. One day of
+/// that spent the request budget by midday and then wrote 47141 identical skip
+/// lines. The user's message is fixed for the whole turn and changes exactly
+/// once, at the boundary, which is the rate the sidebar actually needs.
+///
+/// `None` means the transcript holds no user message yet, so there is no turn
+/// to analyze.
+pub fn turn_key(events: &[SessionEvent]) -> Option<u64> {
+    let last = events.iter().rposition(|event| event.role == "user")?;
+    Some(context_fingerprint(&events[last].text))
+}
+
+/// The boundary this pane is sitting on, or `None` when the turn's two calls
+/// are already spent.
+///
+/// Both arms are level-triggered rather than edge-triggered: the condition
+/// stays true until the call actually lands, so a call deferred by the request
+/// spacer, the provider cooldown, or the daily cap is made on a later poll
+/// instead of being lost with the edge that produced it.
+pub fn analysis_phase(
+    newest_user_is_last: bool,
+    working: bool,
+    start_done: bool,
+    end_done: bool,
+) -> Option<AnalysisPhase> {
+    if newest_user_is_last {
+        // The agent has not answered yet, so there is nothing to judge and only
+        // the task to name.
+        return (!start_done).then_some(AnalysisPhase::TurnStart);
+    }
+    (!working && !end_done).then_some(AnalysisPhase::TurnEnd)
+}
+
 fn strip_code_fences(text: &str) -> String {
     let mut inside = false;
     text.lines()
@@ -1014,8 +1072,15 @@ struct PersistedDisplayState {
     /// When the semantic verdict was drawn, so a later hook signal can retire it.
     #[serde(default)]
     analysis_unix_ms: u64,
+    /// The turn whose start has already been named, so a task summary costs one
+    /// request per turn however long the turn runs.
     #[serde(default)]
-    analysis_fingerprint: Option<u64>,
+    analysis_turn_start: Option<u64>,
+    /// The turn whose end has already been judged. This is what holds an
+    /// attention verdict still: once the turn is recorded here, further output
+    /// or a flapping lifecycle cannot draw a second, contradicting verdict.
+    #[serde(default)]
+    analysis_turn_end: Option<u64>,
     /// The user tore the last turn down mid-run; shown as its own status until
     /// the pane works again.
     #[serde(default)]
@@ -1490,7 +1555,8 @@ fn provider_failure_is_transient(code: &str) -> bool {
 
 struct AnalysisOutcome {
     pane_id: String,
-    fingerprint: u64,
+    turn: u64,
+    phase: AnalysisPhase,
     context_chars: usize,
     result: std::result::Result<Analysis, String>,
 }
@@ -1506,9 +1572,8 @@ pub struct Watcher<T: HerdrTransport, C: AnalysisClient, R: SessionReader> {
     state_change_seqs: HashMap<String, u64>,
     reported_revisions: HashMap<String, u64>,
     next_analysis_at: HashMap<String, SystemTime>,
-    /// Consecutive failures for one pane's current context fingerprint. A new
-    /// fingerprint restarts the count, so the cap bounds one context, not a
-    /// pane's whole lifetime.
+    /// Consecutive failures for one pane's current turn. A new turn restarts
+    /// the count, so the cap bounds one turn, not a pane's whole lifetime.
     analysis_attempts: HashMap<String, (u64, u8)>,
     provider_cooldown_until: Option<SystemTime>,
     last_provider_request_at: Option<SystemTime>,
@@ -1570,7 +1635,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                     self.record_analysis(
                         pane,
                         &analysis,
-                        outcome.fingerprint,
+                        outcome.turn,
+                        outcome.phase,
                         outcome.context_chars,
                     )?;
                     self.next_analysis_at
@@ -1588,13 +1654,13 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                         PROVIDER_MAX_ATTEMPTS_TERMINAL
                     };
                     let attempts = match self.analysis_attempts.get_mut(&outcome.pane_id) {
-                        Some(entry) if entry.0 == outcome.fingerprint => {
+                        Some(entry) if entry.0 == outcome.turn => {
                             entry.1 = entry.1.saturating_add(1);
                             entry.1
                         }
                         _ => {
                             self.analysis_attempts
-                                .insert(outcome.pane_id.clone(), (outcome.fingerprint, 1));
+                                .insert(outcome.pane_id.clone(), (outcome.turn, 1));
                             1
                         }
                     };
@@ -1603,11 +1669,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                             Some(SystemTime::now() + PROVIDER_RATE_LIMIT_COOLDOWN);
                     }
                     if attempts >= limit {
-                        // Park this exact context so it is never asked again
-                        // until the pane itself moves on.
+                        // Park this turn so it is never asked again until the
+                        // user takes the next one.
                         self.next_analysis_at.remove(&pane.id);
                         self.analysis_attempts.remove(&outcome.pane_id);
-                        self.abandon_analysis(pane, outcome.fingerprint)?;
+                        self.abandon_analysis(pane, outcome.turn)?;
                         append_log(
                             &self.paths,
                             "analysis_abandoned",
@@ -1703,13 +1769,6 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             .events
             .last()
             .is_some_and(|event| event.role == "user");
-        // While the agent runs, analyze exactly the moment the user's prompt is
-        // the newest event: the summary then names the request being worked on.
-        // Once assistant output lands the working pane is left alone again.
-        if pane.agent_status == "working" && !forced && !newest_user_is_last {
-            let display = self.display_for(pane)?;
-            return self.report_if_changed(pane, &display);
-        }
         // An interruption is the user's own act, not a new task: keep the last
         // summary, mark it, and spend no provider request on the torn turn.
         let interrupted = pane.agent_status != "working"
@@ -1730,8 +1789,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                     changed_unix_ms: now,
                     ..PersistedDisplayState::default()
                 });
-            let context = analysis_context(&parsed.events);
-            state.analysis_fingerprint = Some(context_fingerprint(&context));
+            // Both phases are settled for this turn: the user's own teardown is
+            // not a question to spend a request on, and the turn is over.
+            let turn = turn_key(&parsed.events);
+            state.analysis_turn_start = turn;
+            state.analysis_turn_end = turn;
             state.interrupted = true;
             write_state_json(
                 &self.paths.display_state(),
@@ -1771,18 +1833,32 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             )?;
             return self.report_if_changed(pane, &display);
         }
-        let fingerprint = context_fingerprint(&context);
-        if !forced
-            && self
-                .display_states
-                .panes
-                .get(&pane.id)
-                .and_then(|state| state.analysis_fingerprint)
-                == Some(fingerprint)
-        {
+        // No user message means no turn, so there is nothing to name or judge.
+        let Some(turn) = turn_key(&parsed.events) else {
             self.next_analysis_at.remove(&pane.id);
             return self.report_if_changed(pane, &display);
-        }
+        };
+        let persisted = self.display_states.panes.get(&pane.id);
+        let phase = if forced {
+            // A refresh request is the user asking directly, so it re-answers
+            // whichever boundary the pane is currently sitting on.
+            Some(if newest_user_is_last {
+                AnalysisPhase::TurnStart
+            } else {
+                AnalysisPhase::TurnEnd
+            })
+        } else {
+            analysis_phase(
+                newest_user_is_last,
+                pane.agent_status == "working",
+                persisted.and_then(|state| state.analysis_turn_start) == Some(turn),
+                persisted.and_then(|state| state.analysis_turn_end) == Some(turn),
+            )
+        };
+        let Some(phase) = phase else {
+            self.next_analysis_at.remove(&pane.id);
+            return self.report_if_changed(pane, &display);
+        };
         if self.analysis_in_flight.contains(&pane.id) {
             return self.report_if_changed(pane, &display);
         }
@@ -1848,7 +1924,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 .map_err(|error| format!("{error:#}"));
             let _ = sender.send(AnalysisOutcome {
                 pane_id,
-                fingerprint,
+                turn,
+                phase,
                 context_chars,
                 result,
             });
@@ -1952,7 +2029,9 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
     /// Give up on one context without inventing a verdict for it: the summary
     /// and the attention already on screen stay untouched, and only the
     /// fingerprint is stored so the deduplication check stops the re-ask.
-    fn abandon_analysis(&mut self, pane: &Pane, fingerprint: u64) -> Result<()> {
+    /// Give up on a turn after the retry cap. Both phases are recorded so the
+    /// retry loop cannot restart from the other boundary of the same turn.
+    fn abandon_analysis(&mut self, pane: &Pane, turn: u64) -> Result<()> {
         let now = unix_time_ms()?;
         let state = self
             .display_states
@@ -1963,7 +2042,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 changed_unix_ms: now,
                 ..PersistedDisplayState::default()
             });
-        state.analysis_fingerprint = Some(fingerprint);
+        state.analysis_turn_start = Some(turn);
+        state.analysis_turn_end = Some(turn);
         write_state_json(
             &self.paths.display_state(),
             &self.display_states,
@@ -1975,7 +2055,8 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
         &mut self,
         pane: &Pane,
         analysis: &Analysis,
-        fingerprint: u64,
+        turn: u64,
+        phase: AnalysisPhase,
         context_chars: usize,
     ) -> Result<()> {
         let now = unix_time_ms()?;
@@ -1996,7 +2077,15 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
         state.summary = Some(analysis.summary.clone());
         state.semantic_attention = analysis.attention;
         state.interrupted = false;
-        state.analysis_fingerprint = Some(fingerprint);
+        match phase {
+            AnalysisPhase::TurnStart => state.analysis_turn_start = Some(turn),
+            // Recording the start too keeps a turn first seen at its end from
+            // going back and asking for a summary it no longer needs.
+            AnalysisPhase::TurnEnd => {
+                state.analysis_turn_start = Some(turn);
+                state.analysis_turn_end = Some(turn);
+            }
+        }
         state.analysis_unix_ms = now;
         write_state_json(
             &self.paths.display_state(),
@@ -2009,8 +2098,9 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             "analysis_updated",
             Some(pane),
             Some(&format!(
-                "attention={};context_chars={context_chars};context={fingerprint:016x}",
+                "attention={};phase={};context_chars={context_chars};turn={turn:016x}",
                 analysis.attention.map_or("none", |_| "question"),
+                phase.label(),
             )),
         )
     }

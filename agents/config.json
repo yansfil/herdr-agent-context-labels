@@ -1,0 +1,14 @@
+{
+  "delivery": {
+    "mode": "local"
+  },
+  "verify": {
+    "commands": {
+      "test": "cargo test",
+      "build": "cargo build",
+      "lint": "cargo clippy --all-targets -- -D warnings",
+      "typecheck": "cargo fmt --check"
+    },
+    "commandTimeoutMs": 600000
+  }
+}

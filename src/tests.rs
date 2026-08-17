@@ -17,6 +17,27 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             let _ = self.analysis_sender.send(outcome);
         }
     }
+
+    /// Stand in for the wall clock passing every provider wait - the global
+    /// request spacer and the per-pane wake time it schedules - so a test about
+    /// the trigger is not also a test about a two-second sleep.
+    fn advance_past_provider_waits(&mut self) {
+        self.last_provider_request_at = None;
+        // Pull the scheduled wake-up into the past rather than dropping it:
+        // that entry is what makes the next scan look at an otherwise
+        // unchanged pane at all.
+        for retry_at in self.next_analysis_at.values_mut() {
+            *retry_at = UNIX_EPOCH;
+        }
+    }
+
+    /// One poll cycle: scan, let the provider thread finish, scan again to
+    /// consume its result.
+    fn settle(&mut self) {
+        self.scan().unwrap();
+        self.await_pending_analysis();
+        self.scan().unwrap();
+    }
 }
 
 fn pane(id: &str, agent: AgentKind, status: &str) -> Pane {
@@ -290,13 +311,13 @@ fn done_status_comes_from_herdr() {
     );
     watcher.scan().unwrap();
 
-    watcher.transport.panes[0].agent_status = "done".to_owned();
-    watcher.transport.panes[0].state_change_seq = 2;
+    watcher.transport.panes.borrow_mut()[0].agent_status = "done".to_owned();
+    watcher.transport.panes.borrow_mut()[0].state_change_seq = 2;
     watcher.scan().unwrap();
     assert_eq!(watcher.last_report().status, StatusIcon::Done);
 
-    watcher.transport.panes[0].agent_status = "idle".to_owned();
-    watcher.transport.panes[0].state_change_seq = 3;
+    watcher.transport.panes.borrow_mut()[0].agent_status = "idle".to_owned();
+    watcher.transport.panes.borrow_mut()[0].state_change_seq = 3;
     watcher.scan().unwrap();
     assert_eq!(watcher.last_report().status, StatusIcon::Idle);
 }
@@ -364,14 +385,14 @@ fn a_failed_turn_is_retired_once_the_agent_runs_again() {
     assert_eq!(watcher.last_report().status, StatusIcon::Error);
 
     // The agent picked the work back up, so the old failure is history.
-    watcher.transport.panes[0].agent_status = "working".to_owned();
-    watcher.transport.panes[0].state_change_seq = 2;
+    watcher.transport.panes.borrow_mut()[0].agent_status = "working".to_owned();
+    watcher.transport.panes.borrow_mut()[0].state_change_seq = 2;
     watcher.scan().unwrap();
     assert_eq!(watcher.last_report().status, StatusIcon::Working);
     assert_eq!(load_hook_states(&paths).panes["w1:p1"].attention, None);
 
-    watcher.transport.panes[0].agent_status = "idle".to_owned();
-    watcher.transport.panes[0].state_change_seq = 3;
+    watcher.transport.panes.borrow_mut()[0].agent_status = "idle".to_owned();
+    watcher.transport.panes.borrow_mut()[0].state_change_seq = 3;
     watcher.scan().unwrap();
     assert_eq!(watcher.last_report().status, StatusIcon::Idle);
 }
@@ -535,7 +556,9 @@ fn failures_are_logged_with_actionable_detail() {
     let log = fs::read_to_string(paths.log()).unwrap();
     assert!(log.contains("attention=question"), "log was: {log}");
     assert!(log.contains("context_chars="), "log was: {log}");
-    assert!(log.contains("context=00"), "log was: {log}");
+    // The turn it judged, and which of the turn's two boundaries it answered.
+    assert!(log.contains("turn="), "log was: {log}");
+    assert!(log.contains("phase="), "log was: {log}");
 
     // A transport failure reaches the caller with its reason intact, which is
     // what the watch loop writes into the log.
@@ -728,9 +751,7 @@ fn plain_text_question_survives_a_watcher_restart() {
         FakeSessionReader,
         paths.clone(),
     );
-    watcher.scan().unwrap();
-    watcher.await_pending_analysis();
-    watcher.scan().unwrap();
+    watcher.settle();
     assert_eq!(watcher.last_report().status, StatusIcon::Question);
     drop(watcher);
 
@@ -768,7 +789,7 @@ fn watcher_deduplicates_reports_and_its_own_revision_bump() {
     // Herdr bumps the revision because of our own report; that must not look
     // like a new event, and must not spend another provider request.
     let own_bump = watcher.reported_revisions["w1:p1"];
-    watcher.transport.panes[0].revision = own_bump;
+    watcher.transport.panes.borrow_mut()[0].revision = own_bump;
     assert_eq!(watcher.scan().unwrap(), 0);
     assert_eq!(watcher.client.as_ref().unwrap().calls(), 1);
 }
@@ -789,7 +810,7 @@ fn a_changed_session_is_analyzed_even_inside_the_rate_limit_window() {
     assert_eq!(watcher.client.as_ref().unwrap().calls(), 1);
 
     watcher.last_provider_request_at = Some(SystemTime::now() - Duration::from_secs(3));
-    watcher.transport.panes[0].state_change_seq = 2;
+    watcher.transport.panes.borrow_mut()[0].state_change_seq = 2;
     watcher.scan().unwrap();
     watcher.await_pending_analysis();
     watcher.scan().unwrap();
@@ -1007,25 +1028,289 @@ fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
     assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);
 }
 
+// -------------------------------------------------- turn-keyed analysis
+
+/// The regression this whole design exists for: the old trigger hashed the
+/// context window, which grows with every token the agent emits, so a live pane
+/// asked the provider again on almost every poll.
+#[test]
+fn turn_identity_holds_while_output_grows_and_moves_only_at_a_boundary() {
+    let user = |text: &str| SessionEvent {
+        role: "user",
+        text: text.to_owned(),
+    };
+    let assistant = |text: &str| SessionEvent {
+        role: "assistant",
+        text: text.to_owned(),
+    };
+
+    let mut events = vec![user("정렬 순서를 고쳐줘")];
+    let start = turn_key(&events).unwrap();
+
+    // Everything the agent says during its turn leaves the key alone.
+    for chunk in ["파일을 읽는 중", "테스트를 실행", "커밋했습니다"] {
+        events.push(assistant(chunk));
+        assert_eq!(
+            turn_key(&events),
+            Some(start),
+            "assistant output must not start a new turn"
+        );
+    }
+    // The old trigger keyed on this text, which changed at every step above.
+    assert_ne!(
+        context_fingerprint(&analysis_context(&events)),
+        context_fingerprint(&analysis_context(&events[..1]))
+    );
+
+    // The user speaking is the boundary, and the only one.
+    events.push(user("이제 문서도 고쳐줘"));
+    assert_ne!(turn_key(&events), Some(start));
+
+    // No user message at all means no turn to analyze.
+    assert_eq!(turn_key(&[]), None);
+    assert_eq!(turn_key(&[assistant("혼잣말")]), None);
+}
+
+/// Both arms are level-triggered. An edge-triggered version would lose the call
+/// whenever the request spacer, the cooldown, or the daily cap deferred it.
+#[test]
+fn the_phase_stays_offered_until_its_call_actually_lands() {
+    use AnalysisPhase::{TurnEnd, TurnStart};
+
+    // Turn start: the user has spoken and the agent has not answered.
+    assert_eq!(analysis_phase(true, false, false, false), Some(TurnStart));
+    assert_eq!(analysis_phase(true, true, false, false), Some(TurnStart));
+    // Offered again and again until it is recorded.
+    assert_eq!(analysis_phase(true, true, true, false), None);
+
+    // Turn end: the agent answered and stopped.
+    assert_eq!(analysis_phase(false, false, true, false), Some(TurnEnd));
+    assert_eq!(analysis_phase(false, false, true, true), None);
+    // Still running, so there is nothing to judge yet.
+    assert_eq!(analysis_phase(false, true, true, false), None);
+}
+
+/// One turn buys one summary and one verdict, whatever the agent does in
+/// between. On 2026-08-17 the old trigger spent 470 calls across 19 panes,
+/// 37 of them under ten seconds apart on the same pane.
+#[test]
+fn one_turn_costs_at_most_two_provider_calls() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+    let session = ScriptedSessionReader::new();
+    let mut watcher = Watcher::new(
+        FakeTransport::new(vec![pane("w1:p1", AgentKind::Claude, "idle")]),
+        Some(FakeClient::default()),
+        session,
+        paths.clone(),
+    );
+
+    // Nothing said yet: no turn, so no call however often the watcher polls.
+    for _ in 0..3 {
+        watcher.scan().unwrap();
+    }
+    assert_eq!(watcher.client.as_ref().unwrap().calls(), 0);
+
+    // The user speaks and the agent starts. One call names the task.
+    watcher.session_reader.user("정렬 순서를 고쳐줘");
+    watcher.transport.set_status("working");
+    watcher.settle();
+    assert_eq!(watcher.client.as_ref().unwrap().calls(), 1);
+
+    // The agent works and talks. This is where the old trigger bled requests.
+    for chunk in ["파일을 읽는 중", "테스트 실행", "수정 적용", "커밋 완료"] {
+        watcher.session_reader.assistant(chunk);
+        watcher.advance_past_provider_waits();
+        watcher.settle();
+    }
+    assert_eq!(
+        watcher.client.as_ref().unwrap().calls(),
+        1,
+        "output within a turn must not buy another request"
+    );
+
+    // The turn ends. One call decides whether the pane is waiting on the user.
+    watcher.transport.set_status("idle");
+    watcher.advance_past_provider_waits();
+    watcher.settle();
+    assert_eq!(watcher.client.as_ref().unwrap().calls(), 2);
+
+    // Idling afterwards, and a lifecycle that flaps, are both free.
+    for status in ["idle", "working", "idle", "done"] {
+        watcher.transport.set_status(status);
+        watcher.advance_past_provider_waits();
+        watcher.settle();
+    }
+    assert_eq!(
+        watcher.client.as_ref().unwrap().calls(),
+        2,
+        "one turn must cost at most two requests"
+    );
+
+    // The next turn is a fresh budget of two.
+    watcher.session_reader.user("이제 문서도 고쳐줘");
+    watcher.transport.set_status("working");
+    watcher.advance_past_provider_waits();
+    watcher.settle();
+    assert_eq!(watcher.client.as_ref().unwrap().calls(), 3);
+}
+
+/// The backstops defer work; they must not silently swallow it. An
+/// edge-triggered phase would lose the turn end that happened while the spacer
+/// was closed.
+#[test]
+fn a_call_the_request_spacer_defers_is_still_made_afterwards() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+    let session = ScriptedSessionReader::new();
+    let mut watcher = Watcher::new(
+        FakeTransport::new(vec![pane("w1:p1", AgentKind::Claude, "working")]),
+        Some(FakeClient::default()),
+        session,
+        paths.clone(),
+    );
+
+    watcher.session_reader.user("정렬 순서를 고쳐줘");
+    watcher.settle();
+    assert_eq!(watcher.client.as_ref().unwrap().calls(), 1);
+
+    // The turn ends inside the spacer's window, so its call cannot go out yet.
+    watcher
+        .session_reader
+        .assistant("고쳤습니다. 확인해 주세요.");
+    watcher.transport.set_status("idle");
+    watcher.settle();
+    assert_eq!(
+        watcher.client.as_ref().unwrap().calls(),
+        1,
+        "the spacer must hold the call back"
+    );
+
+    // Nothing about the pane changes; only time passes. The same turn end is
+    // still owed and is now paid.
+    watcher.advance_past_provider_waits();
+    watcher.settle();
+    assert_eq!(
+        watcher.client.as_ref().unwrap().calls(),
+        2,
+        "a deferred call must be made, not dropped"
+    );
+}
+
+/// The symptom the user reported: a pane's question symbol appearing and
+/// vanishing on its own. 158 such flips were recorded on 2026-08-17.
+#[test]
+fn an_attention_verdict_is_held_for_the_rest_of_its_turn() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+    let session = ScriptedSessionReader::new();
+    session.user("이 방식으로 갈까요?");
+    let mut watcher = Watcher::new(
+        FakeTransport::new(vec![pane("w1:p1", AgentKind::Claude, "idle")]),
+        Some(QuestionClient),
+        session,
+        paths.clone(),
+    );
+
+    // The turn ends on a question, so the pane is marked.
+    watcher.session_reader.assistant("이걸로 갈까요?");
+    watcher.scan().unwrap();
+    watcher.await_pending_analysis();
+    watcher.scan().unwrap();
+    assert_eq!(watcher.last_report().status, StatusIcon::Question);
+
+    // Late output and a flapping lifecycle used to re-roll this verdict. The
+    // turn is already judged, so nothing re-decides it.
+    for chunk in ["recap 출력", "백그라운드 셸 종료"] {
+        watcher.session_reader.assistant(chunk);
+        for status in ["idle", "done"] {
+            watcher.transport.set_status(status);
+            watcher.scan().unwrap();
+            watcher.await_pending_analysis();
+            watcher.scan().unwrap();
+            assert_eq!(
+                watcher.last_report().status,
+                StatusIcon::Question,
+                "the verdict must not move inside its own turn"
+            );
+        }
+    }
+}
+
+/// The state file is a cache, but it is the cache that holds a verdict still,
+/// so its shape is part of the contract.
+#[test]
+fn persisted_state_records_both_turn_phases_and_no_fingerprint() {
+    let root = tempdir().unwrap();
+    let paths = StatePaths::for_tests(root.path());
+
+    // A file written by the previous schema must not stop the watcher.
+    fs::create_dir_all(&paths.root).unwrap();
+    fs::write(
+        paths.display_state(),
+        r#"{"panes":{"w1:p1":{"state_change_seq":1,"changed_unix_ms":1,"summary":"이전 요약","analysis_fingerprint":42}}}"#,
+    )
+    .unwrap();
+
+    let session = ScriptedSessionReader::new();
+    session.user("정렬 순서를 고쳐줘");
+    session.assistant("고쳤습니다");
+    let mut watcher = Watcher::new(
+        FakeTransport::new(vec![pane("w1:p1", AgentKind::Claude, "idle")]),
+        Some(FakeClient::default()),
+        session,
+        paths.clone(),
+    );
+    watcher.scan().unwrap();
+    watcher.await_pending_analysis();
+    watcher.scan().unwrap();
+
+    let written = fs::read_to_string(paths.display_state()).unwrap();
+    assert!(
+        !written.contains("analysis_fingerprint"),
+        "the content fingerprint is gone: {written}"
+    );
+    assert!(written.contains("analysis_turn_start"), "{written}");
+    assert!(written.contains("analysis_turn_end"), "{written}");
+}
+
+/// The trigger no longer needs these to stay bounded, but a provider that bills
+/// is the wrong place to remove a limiter, so they stay.
+#[test]
+fn the_provider_backstops_are_still_in_force() {
+    assert_eq!(PROVIDER_REQUEST_INTERVAL, Duration::from_secs(2));
+    assert_eq!(PROVIDER_RATE_LIMIT_COOLDOWN, Duration::from_secs(600));
+    assert_eq!(DAILY_REQUEST_LIMIT, 1000);
+}
+
 // ------------------------------------------------------------------ doubles
 
 struct FakeTransport {
-    panes: Vec<Pane>,
+    panes: RefCell<Vec<Pane>>,
     reports: RefCell<Vec<Display>>,
 }
 
 impl FakeTransport {
     fn new(panes: Vec<Pane>) -> Self {
         Self {
-            panes,
+            panes: RefCell::new(panes),
             reports: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Move Herdr's lifecycle for every pane, the way the real server does
+    /// between polls.
+    fn set_status(&self, status: &str) {
+        for pane in self.panes.borrow_mut().iter_mut() {
+            pane.agent_status = status.to_owned();
+            pane.state_change_seq += 1;
         }
     }
 }
 
 impl HerdrTransport for FakeTransport {
     fn panes(&self) -> Result<Vec<Pane>> {
-        Ok(self.panes.clone())
+        Ok(self.panes.borrow().clone())
     }
     fn report(&self, _: &Pane, display: &Display) -> Result<()> {
         self.reports.borrow_mut().push(display.clone());
@@ -1087,6 +1372,45 @@ struct FailingClient;
 impl AnalysisClient for FailingClient {
     fn analyze(&self, _: &str) -> Result<Analysis> {
         Err(provider_transport_error(ureq::Error::StatusCode(429)))
+    }
+}
+
+/// A transcript the test drives turn by turn, so a scan sees exactly the
+/// conversation state the scenario is about.
+struct ScriptedSessionReader {
+    events: RefCell<Vec<SessionEvent>>,
+}
+
+impl ScriptedSessionReader {
+    fn new() -> Self {
+        Self {
+            events: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn user(&self, text: &str) {
+        self.events.borrow_mut().push(SessionEvent {
+            role: "user",
+            text: text.to_owned(),
+        });
+    }
+
+    /// Assistant output landing mid-turn. This is the churn that used to make
+    /// every poll look like a new question to ask the provider.
+    fn assistant(&self, text: &str) {
+        self.events.borrow_mut().push(SessionEvent {
+            role: "assistant",
+            text: text.to_owned(),
+        });
+    }
+}
+
+impl SessionReader for ScriptedSessionReader {
+    fn read(&self, _: &Pane) -> Result<ParsedSession> {
+        Ok(ParsedSession {
+            events: self.events.borrow().clone(),
+            skipped_lines: 0,
+        })
     }
 }
 

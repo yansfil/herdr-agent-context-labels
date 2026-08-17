@@ -194,7 +194,13 @@ description = "refresh active pane summary"
 
 ## Summary generation
 
-The watcher requests a new analysis after a supported agent settles and its sanitized session fingerprint changes.
+Analysis is keyed to the conversation turn, identified by the user's own last message.
+A turn buys at most two provider requests: one when the user's message is the newest thing in the transcript, which names the task while the agent works, and one when the agent stops, which decides whether the pane is waiting on a reply.
+Nothing the agent emits in between triggers a request, and the attention verdict for a turn is drawn once and then held, so a pane's symbol cannot change on its own while the user is not looking at it.
+
+Keying on the turn rather than on the transcript is deliberate.
+An earlier version hashed the sanitized session window and re-asked whenever that hash moved; because the window grows with every token an agent emits, a busy pane asked again on nearly every poll, and one day the request budget was spent by midday.
+
 Slow provider calls run outside the status loop, so lifecycle and elapsed-time updates continue while a request is in flight.
 
 The fixed model is `openai/gpt-5.6-luna`, called with reasoning disabled, and there is no fallback model.
@@ -236,7 +242,7 @@ The important files are:
 
 | File | Contents |
 | --- | --- |
-| `display-state.json` | Last summaries, semantic attention, fingerprints, and lifecycle timestamps. |
+| `display-state.json` | Last summaries, semantic attention, per-phase analyzed turns, and lifecycle timestamps. |
 | `hook-state.json` | Pending native-hook interaction state. |
 | `settings.json` | Automatic-summary preference. |
 | `usage.json` | Local UTC-day request count. |
