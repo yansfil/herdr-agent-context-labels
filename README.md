@@ -62,6 +62,31 @@ Native hook state wins over semantic question detection, and both win over the o
 Herdr owns the underlying lifecycle verdict.
 In particular, `done` means background work finished before the tab was viewed, while `idle` means the settled pane has been seen.
 
+### Unread and seen
+
+A pane is **unread** when its state changed while you were not looking at it, and becomes **seen** the moment you focus it. That is the whole rule: focus since the last state change.
+
+This distinction drives both the color and the order, so the three interaction symbols are published as two tokens each:
+
+| Unread token | Seen token | Shown for |
+| --- | --- | --- |
+| `$status_question_new` | `$status_question` | `?` |
+| `$status_approval_new` | `$status_approval` | `!` |
+| `$status_error_new` | `$status_error` | `×` |
+
+Color the `_new` variants to stand out and the plain ones to recede — that is why one `?` can be bright and another grey. The remaining states (`working`, `done`, `interrupted`, `idle`, `stale`) have a single token each.
+
+### Where each symbol comes from
+
+Not every symbol has the same source, which matters if you skip the optional [agent hooks](#agent-hooks):
+
+| Symbol | Source | Without hook wiring |
+| --- | --- | --- |
+| `●` `○` `~` `‖` | Herdr's lifecycle, read from the screen | works |
+| `!` | Herdr's `blocked` lifecycle, or the hook seeing a permission request | works; the hook only makes it arrive sooner |
+| `?` | The hook seeing a question tool, or the model reading plain prose | works, but every `?` is an inference rather than a confirmed fact |
+| `×` | The `StopFailure` hook only | **never appears** |
+
 ## Requirements
 
 - Herdr 0.8.0 or newer.
@@ -74,6 +99,9 @@ Lifecycle symbols continue to work without OpenRouter.
 If the key is missing or invalid, the watcher keeps existing summaries and records `credential_unavailable` locally without making an external request.
 
 ## Install
+
+This document is the canonical reference for installing and configuring the plugin.
+[INSTALL.md](INSTALL.md) is a Korean quick start that points back here for anything it does not cover; where the two ever disagree, this file is right.
 
 Install directly from GitHub:
 
@@ -118,25 +146,36 @@ agent_panel_sort = "priority"
 [ui.sidebar.agents]
 rows = [
   [
-    { token = "$status_question", fg = "#f9e2af", bold = true },
-    { token = "$status_approval", fg = "#fab387", bold = true },
-    { token = "$status_error", fg = "#f38ba8", bold = true },
-    { token = "$status_working", fg = "#d5a44a", bold = true },
+    { token = "$status_error_new", fg = "#f38ba8", bold = true },
+    { token = "$status_error", fg = "#6c7086", bold = true },
+    { token = "$status_question_new", fg = "#f9e2af", bold = true },
+    { token = "$status_question", fg = "#6c7086", bold = true },
+    { token = "$status_approval_new", fg = "#fab387", bold = true },
+    { token = "$status_approval", fg = "#6c7086", bold = true },
     { token = "$status_done", fg = "#a6e3a1", bold = true },
+    { token = "$status_working", fg = "#89b4fa", bold = true },
+    { token = "$status_interrupted", fg = "#cba6f7", bold = true },
     { token = "$status_idle", fg = "#a6adc8", bold = true },
     { token = "$status_stale", fg = "#6c7086", bold = true },
     "workspace",
     { token = "$agent_codex", fg = "#89b4fa", bold = true },
     { token = "$agent_claude", fg = "#fab387", bold = true },
+    { token = "$elapsed", fg = "#6c7086", dim = true },
   ],
   [
     { token = "$summary", fg = "#74c7ec", bold = true },
-    { token = "$elapsed", fg = "#6c7086", dim = true },
   ],
 ]
 ```
 
-The colors above fit a dark Catppuccin-style palette and can be changed independently from the plugin.
+Every status token the plugin can publish is listed above. A token you leave out is not an error, but the state it represents then renders without color, so the unread states are the ones you least want to omit.
+
+Two rules the colors have to respect:
+
+- `$status_working` and `$status_done` both render `●`, so they must differ. Above, working is blue and a finished-but-unread pane is green.
+- The `_new` variants should read as louder than their seen counterparts, since that contrast is what tells you which panes are still waiting on you.
+
+The palette fits a dark Catppuccin-style theme and is yours to change; the plugin never sets a color.
 
 Validate and reload the configuration:
 
@@ -144,6 +183,32 @@ Validate and reload the configuration:
 herdr config check
 herdr server reload-config
 ```
+
+### Sort order
+
+The watcher installs its own sidebar sort on startup, which ranks panes by who is blocking whom:
+
+1. Finished but unread, in the order `error`, `question`, `approval`, `semantic_question`, `done`.
+2. Still working, whether or not you have seen it.
+3. Everything already seen, with no state ranking at all.
+
+Every group breaks ties on the `activity` clock, so the most recently active pane leads. Group 3 carries no state ranking on purpose: once you have seen a pane, recency is the only thing left that orders it.
+
+To change the ranking, create `sort-order.json` in the plugin's config directory:
+
+```bash
+mkdir -p ~/.config/herdr/plugins/config/herdr-agent-context-labels
+cat > ~/.config/herdr/plugins/config/herdr-agent-context-labels/sort-order.json <<'EOF'
+{"order": ["error", "question", "approval", "semantic_question", "done", "working", "interrupted", "idle", "stale"]}
+EOF
+```
+
+The list above is the built-in default, so writing it verbatim changes nothing. Notes:
+
+- **This file replaces the built-in order outright.** If it exists, the default no longer applies, and a plugin upgrade that reorders the default will not reach you until you update or delete this file.
+- Naming only some states puts those first and appends the rest in their default relative order. Unknown names are ignored, and invalid JSON leaves the default in place rather than failing the watcher.
+- The file is read once per process, so a change takes effect on the next watcher start.
+- It reorders states within the unread group; it cannot move a pane between the three groups, because unread, working, and seen are decided by the pane, not by this file.
 
 ## Agent hooks
 
@@ -167,7 +232,12 @@ Register that command for these events without replacing existing hooks:
 | `UserPromptSubmit` / `SessionStart` | Clear attention when the user or a new session resumes work. |
 
 Tool-call IDs are matched before a completion clears pending attention, so an unrelated parallel tool cannot clear the wrong question or approval.
-Without the optional hook wiring, summaries and Herdr lifecycle symbols still work, and OpenRouter can still identify direct plain-text questions.
+
+The wiring is optional, but it is not cosmetic. Without it, summaries and every Herdr lifecycle symbol still work and the model still identifies direct plain-text questions, so `?` and `!` both keep appearing. What you lose is precision on two of them and one symbol entirely:
+
+- `×` never appears. An error verdict has no source other than the `StopFailure` hook, so a turn that ended in failure is indistinguishable from one that ended normally.
+- Every `?` is the model's reading of prose rather than a confirmed question tool, which also ranks it below a hook-confirmed question in the sidebar order.
+- `!` still arrives from Herdr's `blocked` lifecycle, just later — the hook sees a permission request before the dialog reaches the screen.
 
 ## Actions
 
@@ -219,7 +289,8 @@ Automatic summaries are enabled by default and the chosen setting survives watch
 ## Privacy
 
 The plugin reads the local JSONL session reported by Herdr for each supported pane.
-Only the conversation from the latest user turn is considered, with an upper bound of 4,000 characters.
+The context spans the last two user turns, with an upper bound of 4,000 characters.
+Two turns rather than one, because whether a closing message is a fresh question or a wrap-up of one already answered is often only visible in the preceding exchange.
 
 Before anything is sent to OpenRouter, the plugin:
 
@@ -272,7 +343,23 @@ Verify one sanitized provider call without changing pane metadata:
 ./target/release/herdr-agent-context-labels verify-live-provider
 ```
 
+Classify an arbitrary transcript to see what the model would decide, without touching any pane:
+
+```bash
+printf 'user: run the build\nassistant: The build finished. Shall I deploy?' \
+  | ./target/release/herdr-agent-context-labels analyze-stdin
+```
+
 Common event codes include `credential_unavailable`, `raw_session_unavailable`, `analysis_provider_failed`, and `analysis_skipped_daily_limit`.
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `credential_unavailable` | The key is unset or malformed. Check the export and restart the watcher. |
+| `raw_session_unavailable` | Herdr's reported session and the file on disk disagree. Send the pane one message to refresh it. |
+| `provider_http_429` | The provider rate-limited the account. The watcher backs off for ten minutes on its own. |
+| `analysis_skipped_daily_limit` | The local 1,000-per-day ceiling is spent. Reset `requests` in `usage.json` to resume today. |
+| A summary looks stale | Summaries refresh once per turn, so a pane mid-turn keeps the label it was given at the start. Use the refresh action to re-ask immediately. |
+| Two watchers seem to run | They cannot; a file lock guarantees one. A `watcher_already_running` log line is normal. |
 
 ## Development
 

@@ -1028,6 +1028,66 @@ fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
     assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);
 }
 
+// ------------------------------------------------------------ documentation
+
+/// The README's configuration example is what users paste, so a token the code
+/// publishes but the example omits ships as a state with no color. That already
+/// happened: the example carried 7 of 11 tokens, and the three unread variants
+/// it dropped are exactly the states a user most needs to see.
+#[test]
+fn the_documented_sidebar_example_colors_every_token_the_plugin_publishes() {
+    // Scope the search to the copy-paste block itself. Checking the whole file
+    // would pass on the prose that merely names a token elsewhere, which is
+    // the drift this test exists to catch.
+    let readme = include_str!("../README.md");
+    let example = readme
+        .split_once("[ui.sidebar.agents]")
+        .and_then(|(_, rest)| rest.split_once("\n```"))
+        .map(|(block, _)| block)
+        .expect("README has no sidebar configuration example");
+
+    for token in STATUS_TOKENS {
+        assert!(
+            example.contains(&format!("${token}")),
+            "README's sidebar example is missing ${token}"
+        );
+    }
+    // Working and done render the same glyph, so identical colors make them
+    // indistinguishable. The README says so; this checks the example obeys it.
+    let color_of = |token: &str| {
+        example
+            .split_once(&format!("{{ token = \"${token}\", fg = \""))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(color, _)| color.to_owned())
+            .unwrap_or_else(|| panic!("no documented color for ${token}"))
+    };
+    assert_ne!(
+        color_of("status_working"),
+        color_of("status_done"),
+        "working and done share the ● glyph and must not share a color"
+    );
+}
+
+/// A wrong model name in the docs is a billing claim, not a typo: one guide
+/// named a free model and told the reader there would be no charge.
+#[test]
+fn the_documented_model_is_the_one_the_code_calls() {
+    let readme = include_str!("../README.md");
+    assert!(
+        readme.contains(MODEL),
+        "README does not name the model the code calls ({MODEL})"
+    );
+    for (name, text) in [
+        ("README.md", readme),
+        ("INSTALL.md", include_str!("../INSTALL.md")),
+    ] {
+        assert!(
+            !text.contains(":free"),
+            "{name} still advertises a free model"
+        );
+    }
+}
+
 // -------------------------------------------------- turn-keyed analysis
 
 /// The regression this whole design exists for: the old trigger hashed the
