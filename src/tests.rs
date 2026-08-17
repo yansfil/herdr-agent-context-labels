@@ -889,12 +889,119 @@ fn sort_rank_orders_user_blocking_states_before_ambient_states() {
 }
 
 #[test]
+fn a_failed_turn_leads_the_default_order_ahead_of_every_question() {
+    assert_eq!(DEFAULT_SORT_ORDER[0], SortKey::Error);
+    let order = resolve_sort_order(None);
+    for later in [
+        SortKey::Question,
+        SortKey::Approval,
+        SortKey::SemanticQuestion,
+        SortKey::Done,
+        SortKey::Working,
+    ] {
+        assert!(
+            sort_rank(&order, SortKey::Error) < sort_rank(&order, later),
+            "error must outrank {later:?}"
+        );
+    }
+    // Reordering must not drop or duplicate a state.
+    for icon in DEFAULT_SORT_ORDER {
+        assert_eq!(
+            DEFAULT_SORT_ORDER.iter().filter(|it| **it == icon).count(),
+            1,
+            "{icon:?} appears more than once"
+        );
+    }
+}
+
+#[test]
+fn unread_work_ranks_by_attention_and_seen_work_only_by_recency() {
+    let order = resolve_sort_order(None);
+    let ranked = |unseen, status, sort_key| {
+        sort_rank_token(
+            &order,
+            &Display {
+                status,
+                sort_key,
+                unseen,
+                ..Display::default()
+            },
+        )
+    };
+
+    // Group 1, unread and finished: error, then the questions, then a plain
+    // completion. Group 2 is the running pane. Group 3 is everything seen.
+    let unread_error = ranked(true, StatusIcon::Error, SortKey::Error);
+    let unread_question = ranked(true, StatusIcon::Question, SortKey::Question);
+    let unread_done = ranked(true, StatusIcon::Done, SortKey::Done);
+    let working = ranked(false, StatusIcon::Working, SortKey::Working);
+    let seen_error = ranked(false, StatusIcon::Error, SortKey::Error);
+    let seen_idle = ranked(false, StatusIcon::Idle, SortKey::Idle);
+
+    assert!(unread_error < unread_question);
+    assert!(unread_question < unread_done);
+    assert!(unread_done < working);
+    assert!(working < seen_error);
+    // Nothing distinguishes two seen panes, so only the recency tiebreak can
+    // order them.
+    assert_eq!(seen_error, seen_idle);
+    // A running pane sorts with the unread group whether or not it was seen.
+    assert_eq!(working, ranked(true, StatusIcon::Working, SortKey::Working));
+}
+
+#[test]
+fn the_activity_token_is_a_fixed_width_clock_two_panes_can_be_compared_on() {
+    // Zero padding keeps a lexicographic comparison agreeing with a numeric
+    // one, which is what the view's descending token sort relies on.
+    assert_eq!(activity_token(1_755_000_000_000).len(), 13);
+    assert!(activity_token(999) < activity_token(1_000));
+    assert_eq!(activity_token(0), "0000000000000");
+
+    let args = metadata_arguments(
+        &pane("w1:p1", AgentKind::Codex, "done"),
+        &Display {
+            status: StatusIcon::Done,
+            sort_key: SortKey::Done,
+            activity_unix_ms: 1_755_000_000_000,
+            ..Display::default()
+        },
+    );
+    assert!(args.iter().any(|item| item == "activity=1755000000000"));
+    // Always set, never cleared: the sidebar cannot order a pane without it.
+    assert!(
+        !args
+            .windows(2)
+            .any(|pair| pair[0] == "--clear-token" && pair[1] == "activity")
+    );
+}
+
+#[test]
+fn the_view_breaks_ties_on_the_activity_clock_not_the_per_pane_counter() {
+    let request = priority_agent_view_request();
+    let sort = request.pointer("/params/sort").unwrap().as_array().unwrap();
+
+    assert_eq!(sort.len(), 2);
+    assert_eq!(
+        sort[0],
+        serde_json::json!({"field": {"token": "sort_rank"}, "order": "asc"})
+    );
+    assert_eq!(
+        sort[1],
+        serde_json::json!({"field": {"token": "activity"}, "order": "desc"})
+    );
+    // The old key ranked panes by how many times they had changed, not when.
+    assert!(!request.to_string().contains("state_change_seq"));
+}
+
+#[test]
 fn user_sort_order_reorders_listed_states_and_appends_the_rest() {
     let order = resolve_sort_order(Some(r#"{"order":["working","question","nonsense"]}"#));
     assert_eq!(order[0], SortKey::Working);
     assert_eq!(order[1], SortKey::Question);
-    // Unlisted states keep their default relative order after the listed ones.
-    assert_eq!(order[2], SortKey::Approval);
+    // Unlisted states keep their default relative order after the listed ones,
+    // so the head of the default order that survives the list comes first.
+    assert_eq!(order[2], SortKey::Error);
+    assert_eq!(order[3], SortKey::Approval);
     assert_eq!(order[8], SortKey::Stale);
     // Broken JSON must not take the watcher down or scramble the order.
     assert_eq!(resolve_sort_order(Some("not json")), DEFAULT_SORT_ORDER);

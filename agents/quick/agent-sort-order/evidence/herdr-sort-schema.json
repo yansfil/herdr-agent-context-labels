@@ -1,0 +1,57 @@
+{
+  "herdr_version": "0.8.0",
+  "schema_version": 1,
+  "AgentViewSortField": {
+    "anyOf": [
+      {
+        "$ref": "#/schemas/request/$defs/AgentViewBuiltinSortField"
+      },
+      {
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      }
+    ]
+  },
+  "AgentViewSortOrder": {
+    "enum": [
+      "asc",
+      "desc"
+    ],
+    "type": "string"
+  },
+  "AgentViewBuiltinSortField": {
+    "enum": [
+      "workspace_order",
+      "tab_order",
+      "pane_order",
+      "attention",
+      "status",
+      "agent",
+      "seen",
+      "state_change_seq"
+    ],
+    "type": "string"
+  },
+  "AgentViewSort": {
+    "properties": {
+      "field": {
+        "$ref": "#/schemas/request/$defs/AgentViewSortField"
+      },
+      "order": {
+        "$ref": "#/schemas/request/$defs/AgentViewSortOrder",
+        "default": "asc"
+      }
+    },
+    "required": [
+      "field"
+    ],
+    "type": "object"
+  }
+}

@@ -33,7 +33,7 @@ Each supported pane gets a short task label, lifecycle status, agent kind, and t
 - Shows compact elapsed time such as `12s`, `4m`, `2h`, or `3d`.
 - Keeps completion semantics aligned with Herdr's native `working`, `done`, `idle`, `blocked`, and `unknown` lifecycle states.
 - Uses native agent hooks for high-confidence interaction signals and OpenRouter for task summaries and plain-text question detection.
-- Publishes a `sort_rank` token and installs an `agent.view.set` sort on watcher start, so the sidebar orders panes attention-first: question/approval, then error, then unseen completion, then working, then idle.
+- Publishes `sort_rank` and `activity` tokens and installs an `agent.view.set` sort on watcher start, so the sidebar orders panes by who is blocking whom: work that finished unread comes first (error, then question/approval, then a plain completion), then work still running, then everything already seen. Ties inside every group break on the `activity` clock, so the most recently active pane leads.
 - Runs one headless watcher, so no dedicated watcher pane is required.
 
 The data flow is intentionally small:

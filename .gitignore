@@ -2,3 +2,5 @@
 .DS_Store
 # Runtime state and evidence only; PRDs and the rules ledger are committed.
 /agents/implement/
+# PRD pipeline runtime state
+agents/runs/

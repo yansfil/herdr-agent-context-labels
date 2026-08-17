@@ -143,14 +143,14 @@ impl SortKey {
     }
 }
 
-/// Attention-first default: hook-confirmed interaction states, then the
-/// provider-inferred question, then error, an unseen completion, and the
-/// ambient states.
+/// Attention-first default: a failed turn is the most expensive thing to leave
+/// unread, so it leads, then the hook-confirmed interaction states, then the
+/// provider-inferred question, an unseen completion, and the ambient states.
 pub const DEFAULT_SORT_ORDER: [SortKey; 9] = [
+    SortKey::Error,
     SortKey::Question,
     SortKey::Approval,
     SortKey::SemanticQuestion,
-    SortKey::Error,
     SortKey::Done,
     SortKey::Working,
     SortKey::Interrupted,
@@ -205,6 +205,30 @@ pub fn sort_rank(order: &[SortKey; 9], status: SortKey) -> String {
         .position(|icon| *icon == status)
         .unwrap_or(order.len());
     position.to_string()
+}
+
+/// Rank digit used for every pane in the seen partition. Seen panes are ordered
+/// by recency alone, so they must all compare equal here; the value only has to
+/// be a constant, and zero keeps the token's two-digit shape.
+const SEEN_RANK: &str = "0";
+
+/// Two characters. The first partitions unseen work above seen work, with a
+/// running pane always counted into the unseen partition because active work is
+/// not something the user has finished looking at. The second orders by
+/// attention within the unseen partition and is flattened in the seen one.
+pub fn sort_rank_token(order: &[SortKey; 9], display: &Display) -> String {
+    if display.unseen || display.status == StatusIcon::Working {
+        format!("0{}", sort_rank(order, display.sort_key))
+    } else {
+        format!("1{SEEN_RANK}")
+    }
+}
+
+/// Epoch milliseconds are 13 digits until the year 2286; the fixed width makes
+/// a lexicographic comparison agree with a numeric one, so the token sorts
+/// correctly whichever way Herdr compares it.
+pub fn activity_token(activity_unix_ms: u64) -> String {
+    format!("{activity_unix_ms:013}")
 }
 
 /// Resolved once per process: the watcher reports every rank, so a mid-run
@@ -363,6 +387,10 @@ pub struct Display {
     pub sort_key: SortKey,
     pub elapsed: Option<String>,
     pub unseen: bool,
+    /// When the pane last changed state, in epoch milliseconds. Published as
+    /// its own token because the sidebar's recency tiebreak needs a clock two
+    /// panes can be compared on, which `state_change_seq` is not.
+    pub activity_unix_ms: u64,
 }
 
 impl Default for Display {
@@ -373,6 +401,7 @@ impl Default for Display {
             sort_key: SortKey::Stale,
             elapsed: None,
             unseen: false,
+            activity_unix_ms: 0,
         }
     }
 }
@@ -1329,7 +1358,7 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
     };
     // One report may touch at most 16 tokens, so clear only what this report
     // does not overwrite: every other status token, and elapsed when absent.
-    // sort_rank and the agent glyph are always set, never cleared.
+    // sort_rank, activity, and the agent glyph are always set, never cleared.
     for token in STATUS_TOKENS.iter().copied() {
         if token != status_token {
             args.extend(["--clear-token".to_owned(), token.to_owned()]);
@@ -1339,18 +1368,11 @@ pub fn metadata_arguments(pane: &Pane, display: &Display) -> Vec<String> {
         "--token".to_owned(),
         format!("{status_token}={}", display.status.symbol()),
         "--token".to_owned(),
-        // Two characters: unseen panes partition above seen ones, then the
-        // attention rank orders within each partition. A running pane ignores
-        // the partition: active work always sorts with the unseen group.
-        format!(
-            "sort_rank={}{}",
-            if display.unseen || display.status == StatusIcon::Working {
-                '0'
-            } else {
-                '1'
-            },
-            sort_rank(&SORT_ORDER, display.sort_key)
-        ),
+        format!("sort_rank={}", sort_rank_token(&SORT_ORDER, display)),
+        "--token".to_owned(),
+        // The view sorts on this descending, so panes tie-break by when they
+        // last moved rather than by how many times they have moved.
+        format!("activity={}", activity_token(display.activity_unix_ms)),
     ]);
     match &display.elapsed {
         Some(elapsed) => args.extend(["--token".to_owned(), format!("elapsed={elapsed}")]),
@@ -2046,6 +2068,11 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             .panes
             .get(&pane.id)
             .is_some_and(|state| state.unseen);
+        let activity_unix_ms = self
+            .display_states
+            .panes
+            .get(&pane.id)
+            .map_or(0, |state| state.changed_unix_ms);
         if interrupted {
             return Ok(Display {
                 summary: self
@@ -2057,6 +2084,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
                 sort_key: SortKey::Interrupted,
                 elapsed: self.elapsed_for(pane)?,
                 unseen,
+                activity_unix_ms,
             });
         }
         let sort_key = match attention {
@@ -2084,6 +2112,7 @@ impl<T: HerdrTransport, C: AnalysisClient, R: SessionReader> Watcher<T, C, R> {
             sort_key,
             elapsed: self.elapsed_for(pane)?,
             unseen,
+            activity_unix_ms,
         })
     }
 
@@ -2118,11 +2147,8 @@ pub fn format_elapsed(elapsed_ms: u64) -> String {
 /// `agent.view.set` is transient by design, so the watcher reapplies it on
 /// every start. Panes without a `sort_rank` token sort after ranked panes,
 /// which leaves unsupported agents at the bottom rather than interleaved.
-pub fn apply_priority_agent_view(home: &Path) -> Result<()> {
-    let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config/herdr/herdr.sock"));
-    let request = serde_json::json!({
+pub fn priority_agent_view_request() -> serde_json::Value {
+    serde_json::json!({
         "id": "agent-context-labels:view",
         "method": "agent.view.set",
         "params": {
@@ -2130,10 +2156,20 @@ pub fn apply_priority_agent_view(home: &Path) -> Result<()> {
             "label": "attention priority",
             "sort": [
                 {"field": {"token": "sort_rank"}, "order": "asc"},
-                {"field": "state_change_seq", "order": "desc"},
+                // `state_change_seq` counts changes per pane, so it cannot rank
+                // two panes against each other; the activity token carries a
+                // shared clock and does.
+                {"field": {"token": "activity"}, "order": "desc"},
             ],
         },
-    });
+    })
+}
+
+pub fn apply_priority_agent_view(home: &Path) -> Result<()> {
+    let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config/herdr/herdr.sock"));
+    let request = priority_agent_view_request();
     let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
         .context("cannot connect to the Herdr socket")?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
