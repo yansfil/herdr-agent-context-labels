@@ -277,9 +277,36 @@ fn context_spans_the_last_two_user_turns() {
     // question is not mistaken for a fresh one.
     assert!(context.contains("직전 요청입니다"));
     assert!(context.contains("직전 응답입니다"));
-    // Anything older still stays out.
-    assert!(!context.contains("가장 오래된 요청입니다"));
+    // Every user turn is carried too, so the summary can see the whole arc of
+    // what was asked, not just the latest exchange.
+    assert!(context.contains("가장 오래된 요청입니다"));
+    // Older assistant prose is not part of that request history and stays out.
     assert!(!context.contains("가장 오래된 응답입니다"));
+}
+
+#[test]
+fn all_user_requests_is_capped_to_the_recent_turns() {
+    let mut events: Vec<SessionEvent> = Vec::new();
+    for i in 0..(MAX_USER_REQUEST_TURNS + 3) {
+        events.push(SessionEvent {
+            role: "user",
+            text: format!("요청 {i}"),
+        });
+        events.push(SessionEvent {
+            role: "assistant",
+            text: format!("응답 {i}"),
+        });
+    }
+
+    let context = analysis_context(&events);
+
+    // The oldest requests, beyond the cap, are dropped.
+    assert!(!context.contains("요청 0"));
+    assert!(!context.contains("요청 2"));
+    // The most recent MAX_USER_REQUEST_TURNS requests survive.
+    for i in (events.len() / 2 - MAX_USER_REQUEST_TURNS)..(events.len() / 2) {
+        assert!(context.contains(&format!("요청 {i}")));
+    }
 }
 
 // ---------------------------------------------------------------- AC7

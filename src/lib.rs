@@ -18,6 +18,11 @@ pub const MODEL: &str = "openai/gpt-5.6-luna";
 /// user turn; this only guards against one enormous turn.
 pub const MAX_ANALYSIS_CONTEXT_CHARS: usize = 4_000;
 pub const MAX_SUMMARY_CHARS: usize = 30;
+/// How many of the session's user turns feed the summary's "what was asked"
+/// arc. Unbounded, a long session would grow the per-poll context (and cost)
+/// with every new turn; this caps it to the recent history that still shapes
+/// the current task title.
+pub const MAX_USER_REQUEST_TURNS: usize = 8;
 /// Only the tail of a session file can change the current verdict, and session
 /// files reach several megabytes.
 pub const SESSION_TAIL_BYTES: u64 = 256 * 1024;
@@ -536,7 +541,25 @@ pub fn analysis_context(events: &[SessionEvent]) -> String {
         .map(|event| format!("{}: {}", event.role, event.text))
         .collect::<Vec<_>>()
         .join("\n");
-    redact(&strip_code_fences(&transcript))
+
+    // The session's recent user turns, not just the latest one: the summary
+    // is a task title for the ongoing work, so it needs the arc of what was
+    // asked, not just the fragment attached to the most recent exchange.
+    // Capped so a long session does not grow the per-poll context forever.
+    let mut user_requests = events
+        .iter()
+        .filter(|event| event.role == "user")
+        .map(|event| event.text.as_str())
+        .collect::<Vec<_>>();
+    if user_requests.len() > MAX_USER_REQUEST_TURNS {
+        user_requests = user_requests.split_off(user_requests.len() - MAX_USER_REQUEST_TURNS);
+    }
+    let user_requests = user_requests.join("\n---\n");
+
+    let combined = format!(
+        "<all-user-requests>\n{user_requests}\n</all-user-requests>\n<latest-exchange>\n{transcript}\n</latest-exchange>"
+    );
+    redact(&strip_code_fences(&combined))
 }
 
 /// Which of a turn's two boundaries an analysis is answering.
@@ -1488,11 +1511,17 @@ impl AnalysisClient for OpenRouterClient {
             "messages": [
                 {"role": "system", "content": concat!(
                     "확인된 최신 코딩 에이전트 세션 이벤트를 분석하세요. ",
+                    "입력은 두 구간으로 나뉩니다: <all-user-requests>는 이 세션에서 사용자가 보낸 모든 메시지를 ",
+                    "시간순으로 담고 있고, <latest-exchange>는 판정에 필요한 가장 최근 주고받음(user/assistant)입니다. ",
                     "Markdown 없이 정확히 세 개의 필드를 이 순서로 가진 JSON 객체 하나만 반환하세요: ",
                     "{\"expected_reply\":\"...\",\"summary\":\"...\",\"attention\":\"question|none\"}. ",
-                    "summary는 8~30자 사이의 구체적인 한국어 작업 제목이어야 하며, 사용자의 실제 목표를 설명해야 합니다. ",
+                    "summary는 8~30자 사이의 구체적인 한국어 작업 제목이어야 하며, ",
+                    "<all-user-requests> 전체를 근거로 사용자가 무엇을 시켰는지(요청 내용)를 써야 합니다. ",
+                    "에이전트가 무엇을 했는지, 무엇을 답했는지, 진행 결과나 상태가 아니라 사용자의 요청 자체를 요약하세요. ",
+                    "세션 도중 요청이 바뀌거나 늘어났다면 최신 요청을 중심으로 큰 그림을 담되, ",
+                    "이전 요청들과 이어지는 맥락이 있다면 반영하세요. ",
                     "명령어, 도구 출력, 오류 조각, 서식 지시를 그대로 옮기면 안 됩니다. ",
-                    "attention 기준은 하나입니다: 마지막 assistant 메시지가 사용자의 다음 행동",
+                    "attention 기준은 하나입니다: <latest-exchange>의 마지막 assistant 메시지가 사용자의 다음 행동",
                     "(특정 질문에 대한 대답, 선택지 중 선택, 진행 승인, 특정 정보 제공)을 명확하게 요구하면 question, 아니면 none. ",
                     "에이전트가 사용자에게 직접 답하라고 낸 질문이나 문제(퀴즈 출제 포함)는 명시적 요청 문구가 없어도 ",
                     "대답이 기대되는 요구이므로 question입니다. ",
